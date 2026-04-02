@@ -289,19 +289,19 @@ class BaseEvaluator(AbstractEvaluator):
         if "reward_batch" in reqs:
             rewards_x_tt = self.gfn.proxy.rewards(self.gfn.env.states2proxy(x_tt))
             logrewards_x_tt = torch.log(rewards_x_tt)
-            lp_data["rewards"] = rewards_x_tt
-            lp_data["logrewards"] = logrewards_x_tt
+            lp_data["rewards"] = torch2np(rewards_x_tt)
+            lp_data["logrewards"] = torch2np(logrewards_x_tt)
 
             if "corr_probs_rewards" in metrics:
                 probs_x_tt = np.exp(logprobs_x_tt.cpu().numpy())
                 lp_metrics["corr_probs_rewards"] = np.corrcoef(
-                    probs_x_tt, rewards_x_tt
+                    probs_x_tt, rewards_x_tt.cpu().numpy()
                 )[0, 1]
                 lp_metrics["corr_logprobs_logrewards"] = np.corrcoef(
-                    logprobs_x_tt, logrewards_x_tt
+                    logprobs_x_tt.cpu().numpy(), logrewards_x_tt.cpu().numpy()
                 )[0, 1]
                 lp_data["probs"] = probs_x_tt
-                lp_data["logprobs"] = logprobs_x_tt
+                lp_data["logprobs"] = logprobs_x_tt.cpu().numpy()
 
             if "var_logrewards_logp" in metrics:
                 lp_metrics["var_logrewards_logp"] = torch.var(
@@ -509,6 +509,7 @@ class BaseEvaluator(AbstractEvaluator):
                     for k in metrics
                 },
                 "data": {},
+                "figs": {},
             }
 
         with open(self.gfn.buffer.test_config.pkl, "rb") as f:
@@ -532,9 +533,13 @@ class BaseEvaluator(AbstractEvaluator):
             all_metrics.update(density_results.get("metrics", {}))
             all_data.update(density_results.get("data", {}))
 
+        # Generate plots from the computed data
+        figs = self.plot(**all_data)
+
         return {
             "metrics": all_metrics,
             "data": all_data,
+            "figs": figs,
         }
 
     def plot(

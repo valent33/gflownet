@@ -391,6 +391,7 @@ def load_gflownet_from_rundir(
         If no checkpoints are found in the directory.
     """
     rundir = resolve_path(rundir)
+    print(rundir)
 
     # Read experiment config
     config = OmegaConf.load(Path(rundir) / ".hydra" / "config.yaml")

@@ -14,7 +14,7 @@ print_config: False
 no_wandb: False
 
 # Device
-device: cpu
+device: cuda # cpu
 # Float precision
 float_precision: 32
 # Number of objects to sample at the end of training
