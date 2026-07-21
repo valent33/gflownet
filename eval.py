@@ -139,8 +139,8 @@ def main(config):
             dct = {k: v + tmp_dict[k] for k, v in dct.items()}
         pickle.dump(dct, open(output_dir / f"{prefix}_samples.pkl", "wb"))
 
-        if "y" in input("Delete temporary files? (y/n)"):
-            shutil.rmtree(tmp_dir)
+        # if "y" in input("Delete temporary files? (y/n)"):
+        shutil.rmtree(tmp_dir)
 
     else:
         print(

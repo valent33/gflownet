@@ -1,0 +1,12 @@
+defaults:
+  - base
+
+_target_: gflownet.proxy.plasma.PlasmaRewardProxy
+
+models_path: ..\Phase1\models
+
+n: 5000
+
+# model_path: ..\..\..\Phase1\models\XGBoost_5000.pkl
+# x_scaler_path: ..\..\..\Phase1\models\x_pipeline_5000.pkl
+# y_scaler_path: ..\..\..\Phase1\models\y_scaler_5000.pkl

@@ -937,6 +937,10 @@ class GFlowNetAgent:
             total=self.n_train_steps,
             disable=self.logger.progressbar["skip"],
         )
+        import csv as _csv
+        _metrics_file = open(Path(self.logger.logdir) / "metrics.csv", "w", newline="")
+        _metrics_writer = _csv.writer(_metrics_file)
+        _metrics_writer.writerow(["iteration", "loss", "mean_reward", "max_reward", "jsd"])
         for self.it in range(self.it, self.n_train_steps + 1):
             # Test and log
             if self.evaluator.should_eval(self.it):
@@ -975,7 +979,14 @@ class GFlowNetAgent:
                     self.opt.step()
                     self.lr_scheduler.step()
                     self.opt.zero_grad()
-
+            _metrics_writer.writerow([
+                self.it,
+                losses["all"].item(),
+                batch.get_terminating_rewards().mean().item(),
+                batch.get_terminating_rewards().max().item(),
+                self.jsd,
+            ])
+            _metrics_file.flush()
             # Log training iteration: progress bar, buffer, metrics, intermediate
             # models
             times = self.log_train_iteration(pbar, losses, batch, times)

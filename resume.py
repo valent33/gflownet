@@ -46,6 +46,9 @@ def main(config):
         )
         return
 
+    if config.n_train_steps is not None:
+        gflownet.n_train_steps = config.n_train_steps
+
     print(
         f"\nTraining GFlowNet will be resumed from step {gflownet.it} from the "
         f" checkpoints and configuration found in {config.rundir}\n"

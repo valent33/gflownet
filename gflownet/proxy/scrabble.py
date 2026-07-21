@@ -60,19 +60,6 @@ class ScrabbleScorer(Proxy):
         list of:
             - Strings
             - List of string tokens
-        See: tests/gflownet/proxy/test_scrabble_proxy.py
-
-        Args
-        ----
-        states : tensor or list
-            If a tensor: A batch of states, where each row is a state and each state
-            represents a sequence by the indices of the token, including the padding.
-            If a list: A batch of state, where each entry is either a string containing
-            the word or a list of letters.
-
-        Returns
-        -------
-        A vector with the score of each sequence in the batch.
         """
         if torch.is_tensor(states):
             output = torch.zeros(states.shape[0], device=self.device, dtype=self.float)
@@ -112,8 +99,6 @@ class ScrabbleScorer(Proxy):
         """
         Returns the indices of the states that match any of the words in the
         vocabulary.
-
-        See: https://stackoverflow.com/a/77419829/6194082
         """
         return (self.vocabulary == states.unsqueeze(1)).all(-1).any(-1)
 

@@ -6,6 +6,10 @@ defaults:
 # Training will continue from the latest checkpoints
 rundir: null
 
+# Optional total number of training steps to run to before stopping.
+# If null, the resumed run keeps the step budget from the loaded config.
+n_train_steps: null
+
 # Print the configuration of the loaded run
 print_config: False
 
