@@ -1,0 +1,8 @@
+_target_: gflownet.proxy.pbo_model.PBOModel
+
+name: pbo_model
+
+problem: 1
+instance_id: 1
+size_int: 10
+dim_profile: [25,25]

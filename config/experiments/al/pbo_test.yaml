@@ -9,19 +9,19 @@ defaults:
 
 # Active Learning experiment settings
 pbo_al_experiment:
-  initial_dataset_size: 50
+  initial_dataset_size: 100
   problems:
     - name: OneMax
       instances: 
-        - id : 3
-          problem_sizes: [[5,5,5,5,5]]
+        - id : 1
+          problem_sizes: [[5,5,5]]
           #problem_sizes: [20, [2,2,2,2,2,2,2,2,2,2], [4,4,4,4,4], [5,5,5,5], [10,10], [20]]
 #        - id : 2
 #          problem_sizes: [10,15]
     - name: LeadingOnes
       instances: 
         - id : 10
-          problem_sizes: [[5,5,5,5,5]]
+          problem_sizes: [[5,5,5]]
 #        - id : 2
 #          problem_sizes: [10,15]
   active_learning_models:
@@ -33,13 +33,12 @@ pbo_al_experiment:
   n_samples_per_al_iteration: 50
   n_al_repeats: 5
 
-
-
 # Buffer
 buffer:
   test:
+    #type: all
     type: random
-    n: 100
+    n: 2000
 
 # GFlowNet hyperparameters
 gflownet:
@@ -50,14 +49,14 @@ gflownet:
     lr: 0.0001
     z_dim: 16
     lr_z_mult: 100
-    n_train_steps: 1500
+    n_train_steps: 5000
 
 # Policy
 policy:
   forward:
     type: mlp
-    n_hid: 128
-    n_layers: 2
+    n_hid: 256
+    n_layers: 3
   backward:
     shared_weights: True
 
@@ -67,11 +66,10 @@ logger:
     online: False
   lightweight: True
   project_name: "nd_env"
-  run_name: "corners"
+  run_name: "test pbo"
   tags: 
     - gflownet
     - nd_env
-    - corners
 
 # Evaluator
 evaluator:

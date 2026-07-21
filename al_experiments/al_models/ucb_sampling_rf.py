@@ -52,7 +52,7 @@ def sample(n_samples, rf, dim_profile, visited, beta=1.0, n_candidates=100):
     rng = np.random.default_rng()
     
     strike = 0
-    while len(samples_x_without_duplicates) < n_samples and strike < 20:
+    while len(samples_x_without_duplicates) < n_samples and strike < 50:
         x_candidates = rng.integers(low=0, high=dim_profile, size=(n_candidates, len(dim_profile)))
         for _ in range(n_samples):
             idx, ucb = ucb_select_rf(rf, x_candidates, beta)
@@ -65,7 +65,7 @@ def sample(n_samples, rf, dim_profile, visited, beta=1.0, n_candidates=100):
             else:
                 print(f"Found duplicate sample, resampling... (strike {strike+1})")
                 strike += 1
-                if strike == 20:
+                if strike == 50:
                     print("Maximum resampling attempts reached, proceeding with available unique samples.")
                     break
             
@@ -75,20 +75,12 @@ def sample(n_samples, rf, dim_profile, visited, beta=1.0, n_candidates=100):
 
 def ucb_sampling_rf(
     config,
-    visited
+    visited,
+    proxy
 ):
-    """
-    Active learning with RF + UCB.
+    if config.proxy.name != "pbo_proxy":
+        raise ValueError("UCB Sampling with Random Forest is only compatible with the PBO Proxy (with Random Forest Model).")
 
-    Parameters
-    ----------
-    X_init, y_init : initial labeled data
-    candidate_generator : function(n) -> X_candidates
-    oracle : function(x) -> y
-    n_steps : number of AL iterations
-    beta : UCB exploration parameter
-    n_candidates : how many candidates to evaluate each step
-    """
     with open(config.proxy.model_path, 'rb') as f:
         rf = pickle.load(f)
 
@@ -99,7 +91,7 @@ def ucb_sampling_rf(
         visited=visited
     )
 
-    return samples_x_without_duplicates, rf.predict(samples_x_without_duplicates).tolist()
+    return samples_x_without_duplicates, proxy.predict(samples_x_without_duplicates)
 
 
 if __name__ == "__main__":

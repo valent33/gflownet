@@ -4,7 +4,7 @@ from gflownet.proxy.base import Proxy
 from torchtyping import TensorType
 
 class PBOProxy(Proxy):
-    def __init__(self, model_path, **kwargs):
+    def __init__(self, model_path, dim_profile, **kwargs):
         super().__init__(**kwargs)
 
         with open(model_path, 'rb') as f:

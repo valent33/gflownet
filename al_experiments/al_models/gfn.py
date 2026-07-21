@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 from gflownet.utils.common import gflownet_from_config
 
-def train_and_sample_gfn(config, visited):
+def train_and_sample_gfn(config, visited, proxy):
     gflownet = gflownet_from_config(config)
     gflownet.train()
 
@@ -33,11 +33,11 @@ def train_and_sample_gfn(config, visited):
 
     missing_count = config.pbo_al_experiment.n_samples_per_al_iteration - len(samples_x_without_duplicates)
     strike = 0
-    while missing_count > 0 and strike < 20:
+    while missing_count > 0 and strike < 50:
         strike += 1
         print(f"Found {missing_count} duplicate samples, resampling to get enough unique samples (strike {strike})...")
 
-        if strike == 20:
+        if strike == 50:
             print("Maximum resampling attempts reached, proceeding with available unique samples.")
             break
         

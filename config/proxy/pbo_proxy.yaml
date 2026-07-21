@@ -1,3 +1,6 @@
 _target_: gflownet.proxy.pbo_proxy.PBOProxy
 
+name: pbo_proxy
+
 model_path: None
+dim_profile: [3,3]
