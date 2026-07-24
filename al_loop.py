@@ -104,7 +104,7 @@ def _next_run_dir(output_dir: str) -> Path:
         except (IndexError, ValueError):
             pass
     next_num = max(nums) + 1 if nums else 0
-    return base / f"run_{next_num:02d}"
+    return base / f"run_{next_num}"
 
 
 def _get_env():
@@ -300,7 +300,7 @@ def run_al_loop(
         space = Space(_get_env())
         initial_X = space.to_dataframe(space.sample_batch(config.n_init, strategy="latin_hypercube", seed=config.seed))
         initial_X = _sanitize_features(initial_X)
-        initial_y = oracle_fn(initial_X)
+        initial_y = oracle_fn(initial_X, space)
     else:
         initial_X = _sanitize_features(initial_X)
 
@@ -376,7 +376,7 @@ def run_al_loop(
 
         # Oracle evaluation
         print(f"  [Oracle] Evaluating {len(selected)} candidates...")
-        y_new = oracle_fn(selected)
+        y_new = oracle_fn(selected, space)
         actual_rewards = reward_fn(y_new)
         oracle_evals_total += len(selected)
 

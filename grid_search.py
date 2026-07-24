@@ -49,7 +49,7 @@ SEARCH_GRID = {
 }
 
 FIXED_CONFIG = {
-    "output_dir":          "./grid_results",
+    "output_dir":          "./grid_results_2",
     "proxy_models_path":   "../Phase1/models/al",
     "proxy_model_name":    "XGBoost",
     "ml_model_name":       "XGBoost",
@@ -80,10 +80,11 @@ def generate_combos():
 
 def run_name(combo: dict, idx: int) -> str:
     return (f"run{idx:04d}"
-            f"_{combo['sampling_strategy'][:4]}"
-            f"_{combo['acquisition'][:3]}"
-            f"_n{combo['n_candidates_per_iter']}"
-            f"_s{combo['seed']}")
+            # f"_{combo['sampling_strategy'][:4]}"
+            # f"_{combo['acquisition'][:3]}"
+            # f"_n{combo['n_candidates_per_iter']}"
+            # f"_s{combo['seed']}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +99,7 @@ def run_one(combo: dict, idx: int, total: int, dry_run: bool = False) -> dict:
     print(f"  {json.dumps(combo)}")
 
     if dry_run:
-        return {"run_name": name, "status": "dry_run", **combo}
+        return {"run": name, "status": "dry_run", **combo}
 
     cfg = ALConfig(**{**FIXED_CONFIG, **combo})
 
@@ -115,7 +116,7 @@ def run_one(combo: dict, idx: int, total: int, dry_run: bool = False) -> dict:
         best = mean = None
 
     return {
-        "run_name": name, "status": status,
+        "run": name, "status": status,
         "elapsed_sec": round(time.time() - t0, 1),
         "best_reward": best, "mean_reward": mean,
         **combo,
@@ -141,11 +142,11 @@ def save_summary(results: list, out_dir: str):
             w.writeheader()
         w.writerows(results_sorted)
     print(f"\n[Summary] {len(results_sorted)} runs → {path}")
-    print(f"\n{'run_name':<35} {'strategy':<10} {'acq':<14} {'best':>8} {'elapsed':>8}")
+    print(f"\n{'run':<35} {'strategy':<10} {'acq':<14} {'best':>8} {'elapsed':>8}")
     print("-" * 80)
     for r in results_sorted[:10]:
         if r.get("best_reward") is not None:
-            print(f"{r['run_name']:<35} {r['sampling_strategy']:<10} {r['acquisition']:<14} "
+            print(f"{r['run']:<35} {r['sampling_strategy']:<10} {r['acquisition']:<14} "
                   f"{r['best_reward']:>8.4f} {r.get('elapsed_sec','?'):>8}")
 
 
@@ -189,8 +190,8 @@ def main():
                 save_summary(results, out_dir)
     else:
         for i, c in enumerate(combos):
-            if i < 250:
-                continue
+            # if i != 111:
+            #     continue
             # print(f"\n[{i+1}/{total}] {run_name(c, i)}")
             # exit()
             results.append(run_one(c, i, total, dry_run=args.dry_run))
