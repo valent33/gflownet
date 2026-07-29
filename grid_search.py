@@ -207,11 +207,11 @@ def main():
                 save_summary(results, out_dir)
     else:
         for i, c in enumerate(combos):
-            if i not in [62, 63, 64, 65]:
-                continue
-            else:
-                print(f"Running {run_name(c, i)}")
-                # exit()
+            # if i not in [62, 63, 64, 65]:
+            #     continue
+            # else:
+            #     print(f"Running {run_name(c, i)}")
+            #     # exit()
             results.append(run_one(c, i, total, dry_run=args.dry_run))
             save_summary(results, out_dir)
 
