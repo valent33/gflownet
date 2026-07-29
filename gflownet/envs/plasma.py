@@ -274,5 +274,5 @@ class Plasma(GFlowNetEnv):
         mapping = []
         for param in self.parameters:
             for choice in param.get_choices():
-                mapping.append(choice[0])  # choice is a 1-tuple like ("nitrogen",) or (150.0,)
+                mapping.append(choice)
         return mapping
