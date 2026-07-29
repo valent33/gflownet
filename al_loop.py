@@ -45,6 +45,8 @@ from space import Space
 from reward import reward_peak, reward_latent
 from machinelearning import train_single_model, predict_with_model, preprocess, build_models
 
+VEM_OUTPUT_COLUMNS = ["rugosity", "conductivity", "homogeneity", "reflectivity"]
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -56,7 +58,7 @@ class ALConfig:
     n_iterations: int = 5
     n_candidates_per_iter: int = 10
 
-    # Sampling strategy: gflownet | random | lhs | grid
+    # Sampling strategy: gflownet | random | lhs | grid | gp | genetic
     # The `phase` column in al_metrics.csv records this value per iteration.
     sampling_strategy: str = "gflownet"
     n_gfn_samples: int = 100          # pool drawn before acquisition
@@ -80,6 +82,15 @@ class ALConfig:
     gfn_resume_steps: int = 10
     proxy_models_path: str = "../Phase1/models/al"
     proxy_model_name: str = "XGBoost"  # stem used in proxy yaml (proxy.n)
+
+    # Gaussian Process pool-proposal (sampling_strategy="gp")
+    gp_pool_multiplier: int = 5   # pool size = n_gfn_samples * gp_pool_multiplier
+    gp_kappa: float = 2.0         # UCB exploration weight (mean + kappa * std)
+
+    # Genetic algorithm pool-proposal (sampling_strategy="genetic")
+    ga_generations: int = 5
+    ga_elite_frac: float = 0.2
+    ga_mutation_rate: float = 0.2
 
     # Output — auto-numbered under output_dir (run_00, run_01, ...)
     output_dir: str = "./al_results"
@@ -128,6 +139,23 @@ def _to_scalar(value):
 def _sanitize_features(df: pd.DataFrame) -> pd.DataFrame:
     return df.apply(lambda col: col.map(_to_scalar))
 
+
+def _full_dataset_df(X_all: pd.DataFrame, y_all: np.ndarray, reward_fn: Callable) -> pd.DataFrame:
+    """
+    Combine features, raw VEM (oracle) outputs, and reward into a single frame.
+    This is the one dataset artifact we persist -- it fully supersedes the old
+    per-iteration candidates_iter_*.csv / dataset_iter_*.csv files.
+    """
+    df = X_all.reset_index(drop=True).copy()
+    if y_all.shape[1] == len(VEM_OUTPUT_COLUMNS):
+        y_cols = VEM_OUTPUT_COLUMNS
+    else:
+        y_cols = [f"y_{i}" for i in range(y_all.shape[1])]
+    for i, col in enumerate(y_cols):
+        df[col] = y_all[:, i]
+    df["reward"] = reward_fn(y_all)
+    return df
+
 # ---------------------------------------------------------------------------
 # Acquisition
 # ---------------------------------------------------------------------------
@@ -161,6 +189,111 @@ def acquire(candidates: pd.DataFrame, rewards: np.ndarray, k: int,
         return candidates.iloc[selected].reset_index(drop=True)
     else:
         raise ValueError(f"Unknown acquisition: {strategy}")
+
+
+# ---------------------------------------------------------------------------
+# GP pool proposal
+# ---------------------------------------------------------------------------
+
+def gp_propose(config: ALConfig, space: Space, X_all: pd.DataFrame, y_all: np.ndarray,
+               reward_fn: Callable, x_pipeline, seed: int = None) -> pd.DataFrame:
+    """
+    Fit a Gaussian Process surrogate on (featurized X -> reward) using all
+    data observed so far, then propose a candidate pool via UCB acquisition
+    over a large randomly-sampled set of unevaluated points.
+
+    Reuses x_pipeline (already fit on X_all for the main ML proxy this
+    iteration) purely for featurization -- keeps GP inputs consistent with
+    whatever encoding/scaling the rest of the pipeline uses.
+
+    Note: the oracle is known to be heteroscedastic / quite noisy, hence the
+    explicit WhiteKernel term -- a pure Matern kernel would overfit to noise.
+    """
+    from sklearn.gaussian_process import GaussianProcessRegressor
+    from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel as C
+
+    X_feat = x_pipeline.transform(_sanitize_features(X_all))
+    y_reward = reward_fn(y_all)
+
+    kernel = C(1.0, (1e-3, 1e3)) * Matern(nu=2.5) + WhiteKernel(noise_level=1e-2)
+    gp = GaussianProcessRegressor(
+        kernel=kernel, normalize_y=True, n_restarts_optimizer=2, random_state=seed
+    )
+    gp.fit(X_feat, y_reward)
+
+    pool_size = config.n_gfn_samples * config.gp_pool_multiplier
+    pool = space.to_dataframe(
+        space.sample_batch(pool_size, strategy="latin_hypercube", seed=seed)
+    )
+    pool = _sanitize_features(pool)
+
+    pool_feat = x_pipeline.transform(pool)
+    mu, sigma = gp.predict(pool_feat, return_std=True)
+    ucb = mu + config.gp_kappa * sigma  # exploration-aware acquisition score
+
+    top_idx = np.argsort(ucb)[::-1][:config.n_gfn_samples]
+    return pool.iloc[top_idx].reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Genetic algorithm pool proposal
+# ---------------------------------------------------------------------------
+
+def genetic_propose(config: ALConfig, space: Space, X_all: pd.DataFrame, y_all: np.ndarray,
+                     reward_fn: Callable, model, x_pipeline, y_scaler,
+                     seed: int = None) -> pd.DataFrame:
+    """
+    Evolve a population of candidates toward higher predicted reward, using
+    the current ML proxy as the fitness function. The initial population is
+    seeded with the best-performing samples observed so far, plus fresh
+    random individuals for diversity.
+    """
+    rng = np.random.default_rng(seed)
+    population_size = config.n_gfn_samples
+
+    rewards_so_far = reward_fn(y_all)
+    n_seed = max(1, population_size // 4)
+    top_idx = np.argsort(rewards_so_far)[::-1][:n_seed]
+    seed_pop = X_all.iloc[top_idx].reset_index(drop=True)
+
+    n_fresh = max(0, population_size - len(seed_pop))
+    fresh_pop = space.to_dataframe(space.sample_batch(n_fresh, strategy="random", seed=seed))
+    population = pd.concat([seed_pop, fresh_pop], ignore_index=True)
+    population = _sanitize_features(population)
+
+    def _fitness(pop_df):
+        y_pred = predict_with_model(model, pop_df, x_pipeline, y_scaler)
+        return reward_fn(y_pred)
+
+    def _crossover(p1, p2):
+        return {p.name: (p1[p.name] if rng.random() < 0.5 else p2[p.name])
+                for p in space.params}
+
+    def _mutate(individual):
+        individual = dict(individual)
+        for p in space.params:
+            if rng.random() < config.ga_mutation_rate:
+                individual[p.name] = p.sample()
+        return individual
+
+    for _ in range(config.ga_generations):
+        fitness = _fitness(population)
+        n_elite = max(1, int(config.ga_elite_frac * len(population)))
+        elite_idx = np.argsort(fitness)[::-1][:n_elite]
+        elites = population.iloc[elite_idx].reset_index(drop=True)
+        elite_records = elites.to_dict("records")
+
+        children = []
+        while len(children) < population_size - n_elite:
+            i1, i2 = rng.integers(0, len(elite_records), size=2)
+            child = _crossover(elite_records[i1], elite_records[i2])
+            child = _mutate(child)
+            children.append(child)
+
+        population = pd.concat([elites, pd.DataFrame(children)], ignore_index=True)
+        population = _sanitize_features(population)
+
+    return population.reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -209,8 +342,6 @@ def gfn_resume(config: ALConfig, rundir: Path, models_dir: Path, log_dir: Path, 
         f"n_samples=0",
         f"hydra.run.dir={_hydra_run_dir(log_dir)}",
     ])
-    # Return the original checkpoint directory so downstream tools (eval.py)
-    # can find the full Hydra config.yaml with logger, gflownet, proxy, etc.
     return rundir
 
 
@@ -268,7 +399,6 @@ class ALLogger:
             w.writeheader()
             w.writerows(self.rows)
 
-
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -294,10 +424,11 @@ def run_al_loop(
     print(f"AL: {run_name}  |  {config.sampling_strategy}  |  {config.n_iterations} iters")
     print(f"{'='*60}\n")
 
+    space = Space(_get_env())
+
     # Initial data
     if initial_X is None:
         print(f"[Init] LHS {config.n_init} samples...")
-        space = Space(_get_env())
         initial_X = space.to_dataframe(space.sample_batch(config.n_init, strategy="latin_hypercube", seed=config.seed))
         initial_X = _sanitize_features(initial_X)
         initial_y = oracle_fn(initial_X, space)
@@ -313,6 +444,10 @@ def run_al_loop(
     oracle_evals_total = len(X_all)
     cumulative_best_reward = float(reward_fn(y_all).max())
 
+    # Persist the initial VEM results + reward right away, so a crash before
+    # iteration 1 still leaves a usable dataset.csv behind.
+    _full_dataset_df(X_all, y_all, reward_fn).to_csv(out / "dataset.csv", index=False)
+
     logger.log(0, n_samples=len(X_all),
                oracle_evals_total=oracle_evals_total,
                oracle_evals_this_iter=len(X_all),
@@ -320,7 +455,7 @@ def run_al_loop(
                mean_reward_so_far=float(reward_fn(y_all).mean()),
                proxy_r2=None,
                proxy_mae=None,
-               phase="init")
+               sampling_strategy="init")
 
     for it in range(1, config.n_iterations + 1):
         t0 = time.time()
@@ -357,22 +492,28 @@ def run_al_loop(
                 gfn_target_steps += effective_resume_steps
                 gfn_rundir = gfn_resume(config, gfn_rundir, models_dir, iter_dir, gfn_target_steps)
             candidates = gfn_sample(config, gfn_rundir)
+        elif config.sampling_strategy == "random":
+            candidates = space.to_dataframe(space.sample_batch(config.n_gfn_samples, strategy="random", seed=config.seed + it))
+        elif config.sampling_strategy == "lhs":
+            candidates = space.to_dataframe(space.sample_batch(config.n_gfn_samples, strategy="latin_hypercube", seed=config.seed + it))
+        elif config.sampling_strategy == "grid":
+            candidates = space.to_dataframe(space.sample_batch(config.n_gfn_samples, strategy="grid", seed=config.seed + it))
+        elif config.sampling_strategy == "gp":
+            print(f"  [GP] Fitting surrogate on {len(X_all)} samples, proposing pool...")
+            candidates = gp_propose(config, space, X_all, y_all, reward_fn, x_pipeline, seed=config.seed + it)
+        elif config.sampling_strategy == "genetic":
+            print(f"  [GA] Evolving population over {config.ga_generations} generations...")
+            candidates = genetic_propose(config, space, X_all, y_all, reward_fn, model, x_pipeline, y_scaler, seed=config.seed + it)
         else:
-            space = Space(_get_env())
-            if config.sampling_strategy == "random":
-                candidates = space.to_dataframe(space.sample_batch(config.n_gfn_samples, strategy="random", seed=config.seed + it))
-            elif config.sampling_strategy == "lhs":
-                candidates = space.to_dataframe(space.sample_batch(config.n_gfn_samples, strategy="latin_hypercube", seed=config.seed + it))
-            elif config.sampling_strategy == "grid":
-                candidates = space.to_dataframe(space.sample_batch(config.n_gfn_samples, strategy="grid", seed=config.seed + it))
+            raise ValueError(f"Unknown sampling_strategy: {config.sampling_strategy}")
+
         candidates = _sanitize_features(candidates)
-        
+
         # Score the sampled pool with the current proxy, then acquire the top subset
         y_pred = predict_with_model(model, candidates, x_pipeline, y_scaler)
         pred_rewards = reward_fn(y_pred)
         selected = acquire(candidates, pred_rewards, config.n_candidates_per_iter,
                            config.acquisition, config.diverse_top_k_lambda)
-        selected.to_csv(out / f"candidates_iter_{it}.csv", index=False)
 
         # Oracle evaluation
         print(f"  [Oracle] Evaluating {len(selected)} candidates...")
@@ -383,7 +524,9 @@ def run_al_loop(
         # Update dataset
         X_all = _sanitize_features(pd.concat([X_all, selected], ignore_index=True))
         y_all = np.vstack([y_all, y_new])
-        X_all.to_csv(out / f"dataset_iter_{it}.csv", index=False)
+
+        # Single, always-current dataset file: features + raw VEM outputs + reward.
+        _full_dataset_df(X_all, y_all, reward_fn).to_csv(out / "dataset.csv", index=False)
 
         all_rewards = reward_fn(y_all)
         cumulative_best_reward = max(cumulative_best_reward, float(all_rewards.max()))
@@ -399,12 +542,13 @@ def run_al_loop(
             proxy_r2=proxy_r2,
             proxy_mae=proxy_mae,
             elapsed_sec=round(time.time() - t0, 1),
-            phase=config.sampling_strategy,
+            sampling_strategy=config.sampling_strategy,
         )
         print(f"  Best so far: {all_rewards.max():.4f} | This iter: {actual_rewards.max():.4f} | n={len(X_all)}")
 
     print(f"\nDone → {out}")
     print(f"Saved metrics → {out / 'al_metrics.csv'}")
+    print(f"Saved dataset → {out / 'dataset.csv'}")
     return X_all, y_all
 
 if __name__ == "__main__":
