@@ -146,7 +146,7 @@ class Logger:
         self.context = str(context)
 
     def progressbar_update(
-        self, pbar, loss, rewards, jsd, use_context=True, n_mean=100
+        self, pbar, loss, rewards, use_context=True, n_mean=100
     ):
         if self.progressbar["skip"]:
             return
@@ -154,8 +154,8 @@ class Logger:
             self.loss_memory.append(loss)
         else:
             self.loss_memory = self.loss_memory[1:] + [loss]
-        description = "Loss: {:.4f} | Mean rewards: {:.2f} | JSD: {:.4f}".format(
-            np.mean(self.loss_memory), np.mean(rewards), jsd
+        description = "Loss: {:.4f} | Mean rewards: {:.2f}".format(
+            np.mean(self.loss_memory), np.mean(rewards)
         )
         pbar.update(1)
         pbar.set_description(description)

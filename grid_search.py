@@ -49,12 +49,12 @@ BUDGET_COMBOS = [
 ]
 
 SEARCH_GRID = {
-    "sampling_strategy": ["random", "lhs", "grid", "gflownet", "gp", "genetic"],
+    "sampling_strategy": ["gflownet", "random", "lhs", "grid", "gp", "genetic"],
     "acquisition":       ["top_k", "diverse_top_k"],
     "reward_fn_name":    ["reward_peak", "reward_latent"],
     "seed":              [123, 456, 789],
-    "init_method":       ["latin_hypercube", "random", "grid"],
-    "gfn_loss":          ["detailedbalance", "trajectorybalance", "flowmatching", "forwardlooking", "base"],
+    "init_method":       ["latin_hypercube", "random"],
+    "gfn_loss":          ["detailedbalance", "trajectorybalance", "flowmatching", "forwardlooking"],
 }
 
 # Fixed loss used for non-gflownet strategies (GFN hyperparameters are
@@ -67,8 +67,8 @@ LOSS_TO_GFN = {
     "trajectorybalance": "trajectorybalance",
     "flowmatching": "flowmatch",
     "forwardlooking": "forwardlooking",
-    "base": "base",
     "vargrad": "vargrad",
+    # "base": "gflownet",
 }
 
 # gfn_loss -> matching `policy` config group (config/policy/<name>.yaml)
@@ -77,8 +77,8 @@ LOSS_TO_POLICY = {
     "trajectorybalance": "mlp_trajectorybalance",
     "flowmatching": "mlp_flowmatch",
     "forwardlooking": "mlp_forwardlooking",
-    "base": "multihead_tree",
     "vargrad": "mlp_vargrad",
+    # "base": "multihead_tree",
 }
 
 FIXED_CONFIG = {

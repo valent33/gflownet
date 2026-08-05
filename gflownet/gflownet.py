@@ -1178,7 +1178,7 @@ class GFlowNetAgent:
 
         # Progress bar
         self.logger.progressbar_update(
-            pbar, losses["all"].item(), rewards.tolist(), self.jsd, self.use_context
+            pbar, losses["all"].item(), rewards.tolist(), self.use_context
         )
 
         # Save intermediate models
