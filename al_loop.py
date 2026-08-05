@@ -80,7 +80,9 @@ class ALConfig:
 
     # GFlowNet
     gfn_n_train_steps: int = 50
-    gfn_resume_steps: int = 10
+    # Loss / policy config groups, must stay in sync
+    gfn_loss: str = "detailedbalance"
+    gfn_policy: str = "mlp_detailedbalance"
     proxy_models_path: str = "../Phase1/models/al"
     proxy_model_name: str = "XGBoost"  # stem used in proxy yaml (proxy.n)
 
@@ -105,7 +107,7 @@ class ALConfig:
 # ---------------------------------------------------------------------------
 
 def _next_run_dir(output_dir: str) -> Path:
-    """Auto-discover next run folder (run_00, run_01, ...) under output_dir."""
+    """Auto-discover next run folder (run_0, run_1, ...) under output_dir."""
     base = Path(output_dir)
     base.mkdir(parents=True, exist_ok=True)
     existing = [d.name for d in base.iterdir() if d.is_dir() and d.name.startswith("run_")]
@@ -330,6 +332,8 @@ def gfn_train(config: ALConfig, models_dir: Path, log_dir: Path, total_steps: in
         "env=plasma", "proxy=plasma",
         f"proxy.models_path={models_dir}",
         f"proxy.n={config.proxy_model_name}",
+        f"loss={config.gfn_loss}",
+        f"policy={config.gfn_policy}",
         f"gflownet.optimizer.n_train_steps={total_steps}",
         f"n_samples=0",
         f"hydra.run.dir={_hydra_run_dir(log_dir)}",
@@ -337,13 +341,15 @@ def gfn_train(config: ALConfig, models_dir: Path, log_dir: Path, total_steps: in
     ])
     return log_dir
 
-def gfn_resume(config, rundir, models_dir, total_steps):
+def gfn_resume(config: ALConfig, rundir: Path, total_steps: int) -> Path:
     rundir = rundir.resolve()
 
     _run("resume.py", [
         f"rundir={rundir}",
         f"n_train_steps={total_steps}",
         "n_samples=0",
+        f"loss={config.gfn_loss}",
+        f"policy={config.gfn_policy}",
     ])
     return rundir
 
@@ -498,12 +504,7 @@ def run_al_loop(
             else:
                 print("[GFN] Resuming...")
                 gfn_target_steps += effective_resume_steps
-                gfn_resume(
-                    config,
-                    gfn_rundir,
-                    models_dir,
-                    gfn_target_steps
-                )
+                gfn_resume(config, gfn_rundir, gfn_target_steps)
             candidates = gfn_sample(config, gfn_rundir)
         elif config.sampling_strategy == "random":
             candidates = space.to_dataframe(space.sample_batch(config.n_candidates, strategy="random", seed=config.seed + it))

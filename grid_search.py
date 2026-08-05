@@ -30,6 +30,11 @@ if str(PHASE1_SRC) not in sys.path:
 from reward import reward_peak, reward_latent
 from VEM import oracle_fn
 
+REWARD_FNS = {
+    "reward_latent": reward_latent,
+    "reward_peak": reward_peak,
+}
+
 # ---------------------------------------------------------------------------
 # Grid search settings
 # ---------------------------------------------------------------------------
@@ -46,9 +51,18 @@ BUDGET_COMBOS = [
 SEARCH_GRID = {
     "sampling_strategy": ["random", "lhs", "grid", "gflownet", "gp", "genetic"],
     "acquisition":       ["top_k", "diverse_top_k"],
-    "reward_fn_name":    ["reward_latent"],
+    "reward_fn_name":    ["reward_peak", "reward_latent"],
     "seed":              [123, 456, 789],
     "init_method":       ["latin_hypercube", "random", "grid"],
+    "gfn_loss":          ["detailedbalance", "trajectorybalance", "flowmatching", "forwardlooking", "base"],
+}
+
+LOSS_TO_POLICY = {
+    "detailedbalance": "mlp_detailedbalance",
+    "trajectorybalance": "mlp_trajectorybalance",
+    "flowmatching": "mlp_flowmatch",
+    "forwardlooking": "mlp_forwardlooking",
+    "base": "multihead_tree"
 }
 
 FIXED_CONFIG = {
@@ -60,6 +74,8 @@ FIXED_CONFIG = {
     "diverse_top_k_lambda": 0.3,
     "gfn_n_train_steps":   1000,
     "n_candidates":       100,
+    # "gfn_loss":            "detailedbalance",
+    # "gfn_policy":          LOSS_TO_POLICY["detailedbalance"],
 }
 
 # ---------------------------------------------------------------------------
@@ -67,14 +83,9 @@ FIXED_CONFIG = {
 # ---------------------------------------------------------------------------
 
 def is_valid(combo: dict) -> bool:
-    # GFN-specific params ignored for non-gflownet strategies
-    # if combo["sampling_strategy"] != "gflownet":
-    #     min_steps = min(SEARCH_GRID["gfn_n_train_steps"])
-    #     if combo["gfn_n_train_steps"] != min_steps:
-    #         return False
-    #     if combo["n_candidates"] != min(SEARCH_GRID["n_candidates"]):
-    #         return False
-    return True
+    # Policy and loss must stay in sync. Combos are generated consistently,
+    # but this guards against hand-edited grids.
+    return combo["gfn_policy"] == LOSS_TO_POLICY[combo["gfn_loss"]]
 
 
 def generate_combos():
@@ -89,24 +100,19 @@ def generate_combos():
                 "n_init": n_init,
                 "n_candidates_per_iter": n_cand,
                 "n_iterations": n_iter,
+                "gfn_loss": base["gfn_loss"],
+                "gfn_policy": LOSS_TO_POLICY[base["gfn_loss"]],
             }
             if is_valid(combo):
                 combos.append(combo)
     return combos
 
 def run_name(combo: dict, idx: int) -> str:
-    return (f"run_{idx}"
-            # f"_{combo['sampling_strategy'][:4]}"
-            # f"_{combo['acquisition'][:3]}"
-            # f"_n{combo['n_candidates_per_iter']}"
-            # f"_s{combo['seed']}"
-            )
-
+    return (f"run_{idx}")
 
 # ---------------------------------------------------------------------------
 # Single run
 # ---------------------------------------------------------------------------
-
 def run_one(combo: dict, idx: int, total: int, dry_run: bool = False) -> dict:
     from al_loop import ALConfig, run_al_loop
 
@@ -117,12 +123,13 @@ def run_one(combo: dict, idx: int, total: int, dry_run: bool = False) -> dict:
     if dry_run:
         return {"run": name, "status": "dry_run", **combo}
 
+    reward_fn = REWARD_FNS[combo["reward_fn_name"]]
     cfg = ALConfig(**{**FIXED_CONFIG, **combo})
 
     t0 = time.time()
     try:
-        X_all, y_all = run_al_loop(cfg, reward_fn=reward_latent, oracle_fn=oracle_fn)
-        rewards = reward_latent(y_all)
+        X_all, y_all = run_al_loop(cfg, reward_fn=reward_fn, oracle_fn=oracle_fn)
+        rewards = reward_fn(y_all)
         status = "ok"
         best = float(rewards.max())
         mean = float(rewards.mean())
@@ -146,22 +153,16 @@ def run_one(combo: dict, idx: int, total: int, dry_run: bool = False) -> dict:
 # Summary
 # ---------------------------------------------------------------------------
 
-def save_summary(results, out_dir):
-    """
-    Append only the most recently completed run to grid_summary.csv.
-    `results` is still the full in-memory list (kept for --resume logic /
-    end-of-run reporting), but we only ever write the LAST entry to disk,
-    so repeated calls don't re-write earlier rows. Header written once.
-    """
+def save_summary(result: dict, out_dir: str) -> None:
+    """Append one completed run to grid_summary.csv (header written once)."""
     path = Path(out_dir) / "grid_summary.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
-    row = results[-1]
     write_header = not path.exists()
     with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        writer = csv.DictWriter(f, fieldnames=list(result.keys()))
         if write_header:
             writer.writeheader()
-        writer.writerow(row)
+        writer.writerow(result)
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -173,6 +174,7 @@ def main():
     parser.add_argument("--parallel", type=int, default=1)
     parser.add_argument("--only", type=str, default=None, help="filter by sampling_strategy")
     parser.add_argument("--seed", type=int, default=None, help="run only this seed")
+    parser.add_argument("--output-dir", type=str, default=FIXED_CONFIG["output_dir"])
     args = parser.parse_args()
 
     combos = generate_combos()
@@ -189,29 +191,26 @@ def main():
             print(f"  [{i+1:3d}] {run_name(c, i)}: {c}")
         return
 
-    results = []
+    FIXED_CONFIG["output_dir"] = args.output_dir
     out_dir = FIXED_CONFIG["output_dir"]
 
     if args.parallel > 1:
         with ProcessPoolExecutor(max_workers=args.parallel) as ex:
             futures = {ex.submit(run_one, c, i, total): i for i, c in enumerate(combos)}
+            completed = 0
             for f in as_completed(futures):
                 try:
-                    results.append(f.result())
+                    result = f.result()
                 except Exception as e:
                     print(f"Worker error: {e}")
-                save_summary(results, out_dir)
+                    continue
+                save_summary(result, out_dir)
+                completed += 1
+                print(f"[{completed}/{total}] {result.get('run')} -> {result['status']}")
     else:
         for i, c in enumerate(combos):
-            # if i not in [62, 63, 64, 65]:
-            #     continue
-            # else:
-            #     print(f"Running {run_name(c, i)}")
-            #     # exit()
-            results.append(run_one(c, i, total, dry_run=args.dry_run))
-            save_summary(results, out_dir)
-
-    # save_summary(results, out_dir)
+            result = run_one(c, i, total)
+            save_summary(result, out_dir)
 
 
 if __name__ == "__main__":
