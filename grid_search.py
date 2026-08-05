@@ -57,6 +57,10 @@ SEARCH_GRID = {
     "gfn_loss":          ["detailedbalance", "trajectorybalance", "flowmatching", "forwardlooking", "base"],
 }
 
+# Fixed loss used for non-gflownet strategies (GFN hyperparameters are
+# irrelevant to them, so we pick a single valid value instead of sweeping).
+GFN_DEFAULT_LOSS = "trajectorybalance"
+
 # gfn_loss -> matching `gflownet` config group (config/gflownet/<name>.yaml)
 LOSS_TO_GFN = {
     "detailedbalance": "detailedbalance",
@@ -105,23 +109,32 @@ def is_valid(combo: dict) -> bool:
 
 
 def generate_combos():
-    keys, vals = list(SEARCH_GRID.keys()), list(SEARCH_GRID.values())
-    base_combos = [dict(zip(keys, v)) for v in itertools.product(*vals)]
+    # Cross product over the shared axes only (the GFN-only axis is handled
+    # separately below so it doesn't multiply non-gflownet strategies).
+    core_keys = [k for k in SEARCH_GRID if k != "gfn_loss"]
+    core_vals = [SEARCH_GRID[k] for k in core_keys]
+    base_combos = [dict(zip(core_keys, v)) for v in itertools.product(*core_vals)]
 
     combos = []
     for base in base_combos:
-        for n_init, n_cand, n_iter in BUDGET_COMBOS:
-            combo = {
-                **base,
-                "n_init": n_init,
-                "n_candidates_per_iter": n_cand,
-                "n_iterations": n_iter,
-                "gfn_loss": base["gfn_loss"],
-                "gfn_gflownet": LOSS_TO_GFN[base["gfn_loss"]],
-                "gfn_policy": LOSS_TO_POLICY[base["gfn_loss"]],
-            }
-            if is_valid(combo):
-                combos.append(combo)
+        # Sweep the GFN loss only for the gflownet strategy; other strategies
+        # get a single fixed value since GFN params don't affect them.
+        losses = (SEARCH_GRID["gfn_loss"]
+                  if base["sampling_strategy"] == "gflownet"
+                  else [GFN_DEFAULT_LOSS])
+        for loss in losses:
+            for n_init, n_cand, n_iter in BUDGET_COMBOS:
+                combo = {
+                    **base,
+                    "n_init": n_init,
+                    "n_candidates_per_iter": n_cand,
+                    "n_iterations": n_iter,
+                    "gfn_loss": loss,
+                    "gfn_gflownet": LOSS_TO_GFN[loss],
+                    "gfn_policy": LOSS_TO_POLICY[loss],
+                }
+                if is_valid(combo):
+                    combos.append(combo)
     return combos
 
 def run_name(combo: dict, idx: int) -> str:
