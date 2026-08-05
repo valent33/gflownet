@@ -57,12 +57,24 @@ SEARCH_GRID = {
     "gfn_loss":          ["detailedbalance", "trajectorybalance", "flowmatching", "forwardlooking", "base"],
 }
 
+# gfn_loss -> matching `gflownet` config group (config/gflownet/<name>.yaml)
+LOSS_TO_GFN = {
+    "detailedbalance": "detailedbalance",
+    "trajectorybalance": "trajectorybalance",
+    "flowmatching": "flowmatch",
+    "forwardlooking": "forwardlooking",
+    "base": "base",
+    "vargrad": "vargrad",
+}
+
+# gfn_loss -> matching `policy` config group (config/policy/<name>.yaml)
 LOSS_TO_POLICY = {
     "detailedbalance": "mlp_detailedbalance",
     "trajectorybalance": "mlp_trajectorybalance",
     "flowmatching": "mlp_flowmatch",
     "forwardlooking": "mlp_forwardlooking",
-    "base": "multihead_tree"
+    "base": "multihead_tree",
+    "vargrad": "mlp_vargrad",
 }
 
 FIXED_CONFIG = {
@@ -74,8 +86,9 @@ FIXED_CONFIG = {
     "diverse_top_k_lambda": 0.3,
     "gfn_n_train_steps":   1000,
     "n_candidates":       100,
-    # "gfn_loss":            "detailedbalance",
-    # "gfn_policy":          LOSS_TO_POLICY["detailedbalance"],
+    "gfn_gflownet":        "trajectorybalance",
+    "gfn_loss":            "trajectorybalance",
+    "gfn_policy":          LOSS_TO_POLICY["trajectorybalance"],
 }
 
 # ---------------------------------------------------------------------------
@@ -83,9 +96,12 @@ FIXED_CONFIG = {
 # ---------------------------------------------------------------------------
 
 def is_valid(combo: dict) -> bool:
-    # Policy and loss must stay in sync. Combos are generated consistently,
-    # but this guards against hand-edited grids.
-    return combo["gfn_policy"] == LOSS_TO_POLICY[combo["gfn_loss"]]
+    # The gflownet/loss/policy config groups must stay in sync. Combos are
+    # generated consistently, but this guards against hand-edited grids.
+    return (
+        combo["gfn_gflownet"] == LOSS_TO_GFN[combo["gfn_loss"]]
+        and combo["gfn_policy"] == LOSS_TO_POLICY[combo["gfn_loss"]]
+    )
 
 
 def generate_combos():
@@ -101,6 +117,7 @@ def generate_combos():
                 "n_candidates_per_iter": n_cand,
                 "n_iterations": n_iter,
                 "gfn_loss": base["gfn_loss"],
+                "gfn_gflownet": LOSS_TO_GFN[base["gfn_loss"]],
                 "gfn_policy": LOSS_TO_POLICY[base["gfn_loss"]],
             }
             if is_valid(combo):

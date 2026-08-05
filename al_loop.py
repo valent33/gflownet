@@ -54,7 +54,7 @@ VEM_OUTPUT_COLUMNS = ["rugosity", "conductivity", "homogeneity", "reflectivity"]
 @dataclass
 class ALConfig:
     # Budget
-    n_init: int = 70
+    n_init: int = 100
     init_method: str = "latin_hypercube"  # random | latin_hypercube | grid
     n_iterations: int = 5
     n_candidates_per_iter: int = 10
@@ -76,13 +76,14 @@ class ALConfig:
     ml_retrain_every: int = 1
 
     # Reward function name (for logging only — pass the fn to run_al_loop)
-    reward_fn_name: str = "reward_peak"
+    reward_fn_name: str = "reward_peak"  # reward_peak | reward_latent
 
-    # GFlowNet
-    gfn_n_train_steps: int = 50
-    # Loss / policy config groups, must stay in sync
-    gfn_loss: str = "detailedbalance"
-    gfn_policy: str = "mlp_detailedbalance"
+    # GFlowNet — Hydra config groups under config/gflownet|loss|policy.
+    # `gfn_gflownet` selects config/gflownet/<name>.yaml, the three must stay in sync.
+    gfn_n_train_steps: int = 500
+    gfn_gflownet: str = "trajectorybalance"
+    gfn_loss: str = "trajectorybalance"
+    gfn_policy: str = "mlp_trajectorybalance"
     proxy_models_path: str = "../Phase1/models/al"
     proxy_model_name: str = "XGBoost"  # stem used in proxy yaml (proxy.n)
 
@@ -332,6 +333,9 @@ def gfn_train(config: ALConfig, models_dir: Path, log_dir: Path, total_steps: in
         "env=plasma", "proxy=plasma",
         f"proxy.models_path={models_dir}",
         f"proxy.n={config.proxy_model_name}",
+        f"proxy.reward_fn={config.reward_fn_name}",
+        # The gflownet/loss/policy config groups must be set together
+        f"gflownet={config.gfn_gflownet}",
         f"loss={config.gfn_loss}",
         f"policy={config.gfn_policy}",
         f"gflownet.optimizer.n_train_steps={total_steps}",
@@ -341,15 +345,15 @@ def gfn_train(config: ALConfig, models_dir: Path, log_dir: Path, total_steps: in
     ])
     return log_dir
 
-def gfn_resume(config: ALConfig, rundir: Path, total_steps: int) -> Path:
+def gfn_resume(rundir: Path, total_steps: int) -> Path:
+    # config/resume.yaml has no gflownet/loss/policy config groups, so those
+    # cannot be overridden here: a resumed run keeps the config from its rundir.
     rundir = rundir.resolve()
 
     _run("resume.py", [
         f"rundir={rundir}",
         f"n_train_steps={total_steps}",
         "n_samples=0",
-        f"loss={config.gfn_loss}",
-        f"policy={config.gfn_policy}",
     ])
     return rundir
 
@@ -504,7 +508,7 @@ def run_al_loop(
             else:
                 print("[GFN] Resuming...")
                 gfn_target_steps += effective_resume_steps
-                gfn_resume(config, gfn_rundir, gfn_target_steps)
+                gfn_resume(gfn_rundir, gfn_target_steps)
             candidates = gfn_sample(config, gfn_rundir)
         elif config.sampling_strategy == "random":
             candidates = space.to_dataframe(space.sample_batch(config.n_candidates, strategy="random", seed=config.seed + it))

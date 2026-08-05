@@ -7,6 +7,10 @@ models_path: ..\Phase1\models
 
 n: 5000
 
+# Reward applied to proxy predictions. Keep in sync with the AL loop's
+# reward_fn_name (grid_search: SEARCH_GRID["reward_fn_name"]).
+reward_fn: reward_peak
+
 # model_path: ..\..\..\Phase1\models\XGBoost_5000.pkl
 # x_scaler_path: ..\..\..\Phase1\models\x_pipeline_5000.pkl
 # y_scaler_path: ..\..\..\Phase1\models\y_scaler_5000.pkl

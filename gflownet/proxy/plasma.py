@@ -11,6 +11,11 @@ from space import GFLOWNET_ENV
 from reward import reward_peak, reward_latent
 from machinelearning import predict_with_model, preprocess
 
+REWARD_FNS = {
+    "reward_peak": reward_peak,
+    "reward_latent": reward_latent,
+}
+
 from typing import List, Union
 import pickle
 import numpy as np
@@ -36,7 +41,10 @@ def _load_first_existing(path_candidates):
 
 class PlasmaRewardProxy(Proxy):
 
-    def __init__(self, models_path: str, n: int = 50, **kwargs):
+    def __init__(self, models_path: str, n: int = 50, reward_fn: str = "reward_peak", **kwargs):
+        # Reward applied to proxy predictions during GFN training. Must match
+        # the reward the AL loop optimises (ALConfig.reward_fn_name).
+        self.reward_fn = REWARD_FNS.get(reward_fn, reward_peak)
         models_path = Path(models_path)
         if not models_path.is_absolute():
             models_path = Path(get_original_cwd()) / models_path
@@ -52,6 +60,11 @@ class PlasmaRewardProxy(Proxy):
             models_path / f"{n}.pkl",
             models_path / "XGBoost.pkl",
         ])
+        # Windows: MultiOutputRegressor with n_jobs>1 spawns joblib/loky
+        # processes that cannot unpickle XGBoost boosters (access violation).
+        # Force serial predict; XGBoost still uses OpenMP threads internally.
+        if hasattr(self.model, "n_jobs"):
+            self.model.set_params(n_jobs=1)
         self.y_scaler = _load_first_existing([
             models_path / f"y_scaler_{n}.pkl",
             models_path / "y_scaler.pkl",
@@ -70,7 +83,7 @@ class PlasmaRewardProxy(Proxy):
         X, _ = preprocess(df_x, self.x_pipeline)
         y_pred = self.model.predict(X)
         y_pred = self.y_scaler.inverse_transform(y_pred)
-        rewards = reward_latent(y_pred)
+        rewards = self.reward_fn(y_pred)
         
          # ── diagnostic block ──────────────────────────────────────────
         if not hasattr(self, '_call_count'):
