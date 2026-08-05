@@ -57,7 +57,7 @@ class PlasmaRewardProxy(Proxy):
             models_path / "y_scaler.pkl",
             models_path / "y_scaler_XGBoost.pkl",
         ])
-        super().__init__(**kwargs)  # always last, after your own attrs are set
+        super().__init__(**kwargs)
 
     def setup(self, env=None):
         self.env = env

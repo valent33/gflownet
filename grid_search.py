@@ -44,11 +44,11 @@ BUDGET_COMBOS = [
 ]
 
 SEARCH_GRID = {
-    # ── Core experimental variables ──
     "sampling_strategy": ["random", "lhs", "grid", "gflownet", "gp", "genetic"],
     "acquisition":       ["top_k", "diverse_top_k"],
-    # ── Reproducibility ──
+    "reward_fn_name":    ["reward_latent"],
     "seed":              [123, 456, 789],
+    "init_method":       ["latin_hypercube", "random", "grid"],
 }
 
 FIXED_CONFIG = {
@@ -58,12 +58,8 @@ FIXED_CONFIG = {
     "ml_model_name":       "XGBoost",
     "ml_retrain_every":    1,
     "diverse_top_k_lambda": 0.3,
-    "reward_fn_name":      "reward_latent",
-
     "gfn_n_train_steps":   1000,
-
-    # Pool size before acquisition filtering. Used by ALL strategies
-    "n_gfn_samples":       100,
+    "n_candidates":       100,
 }
 
 # ---------------------------------------------------------------------------
@@ -76,7 +72,7 @@ def is_valid(combo: dict) -> bool:
     #     min_steps = min(SEARCH_GRID["gfn_n_train_steps"])
     #     if combo["gfn_n_train_steps"] != min_steps:
     #         return False
-    #     if combo["n_gfn_samples"] != min(SEARCH_GRID["n_gfn_samples"]):
+    #     if combo["n_candidates"] != min(SEARCH_GRID["n_candidates"]):
     #         return False
     return True
 

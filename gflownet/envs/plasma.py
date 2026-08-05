@@ -43,7 +43,7 @@ class Plasma(GFlowNetEnv):
         self.max_length = self.n_params
         # Source
         self.source = [self.pad_idx] * self.max_length
-        self.eos_idx = -1  # unambiguous, can't clash with global action indices
+        self.eos_idx = -1
         self.eos = (self.eos_idx,)
         
         self._idx_to_value = self._build_index_to_value() 
@@ -82,7 +82,7 @@ class Plasma(GFlowNetEnv):
 
         current_param = self._get_seq_length(state)
 
-        # all params filled — only EOS is valid
+        # all params filled
         if current_param >= self.n_params:
             mask = [True] * self.action_space_dim
             mask[self.action_space.index(self.eos)] = False  # find (-1,) explicitly
@@ -108,7 +108,7 @@ class Plasma(GFlowNetEnv):
             self.done = True
             return self.state, action, True
 
-        # fill the param — do NOT set done here
+        # fill the param
         pos = self._get_seq_length()
         self.state[pos] = action[0]
 
@@ -124,7 +124,7 @@ class Plasma(GFlowNetEnv):
         pos_last_param = self._get_seq_length(state) - 1
         parent = copy(state)
         parent[pos_last_param] = self.pad_idx
-        p_action = (state[pos_last_param],)  # wrap in tuple — this IS the global action index
+        p_action = (state[pos_last_param],)
         return [parent], [p_action]
     
     def _smoke_test(self):
@@ -183,8 +183,6 @@ class Plasma(GFlowNetEnv):
                     row.append(value)
             rows.append(row)
 
-        # can't use torch.tensor() here — mixed types (str + float)
-        # return as a plain list of lists; proxy __call__ wraps in DataFrame directly
         return rows
 
     def states2policy(
@@ -212,7 +210,7 @@ class Plasma(GFlowNetEnv):
         """
         Converts a state into a human-readable string.
         """
-        pass
+        return [self._idx_to_value[idx] for idx in state if idx != self.pad_idx]
 
     def readable2state(self, readable: str) -> List[int]:
         """

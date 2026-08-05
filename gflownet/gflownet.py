@@ -938,8 +938,13 @@ class GFlowNetAgent:
             disable=self.logger.progressbar["skip"],
         )
         import csv as _csv
-        _metrics_file = open(Path(self.logger.logdir) / "metrics.csv", "w", newline="")
-        _metrics_writer = _csv.writer(_metrics_file)
+        if Path(self.logger.logdir).exists():
+            _metrics_file = open(Path(self.logger.logdir) / "metrics.csv", "a", newline="")
+            _metrics_writer = _csv.writer(_metrics_file)
+        else:
+            Path(self.logger.logdir).mkdir(parents=True, exist_ok=True)
+            _metrics_file = open(Path(self.logger.logdir) / "metrics.csv", "a", newline="")
+            _metrics_writer = _csv.writer(_metrics_file)
         _metrics_writer.writerow(["iteration", "loss", "mean_reward", "max_reward", "jsd"])
         for self.it in range(self.it, self.n_train_steps + 1):
             # Test and log
