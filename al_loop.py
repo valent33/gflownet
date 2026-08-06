@@ -81,6 +81,7 @@ class ALConfig:
     # GFlowNet — Hydra config groups under config/gflownet|loss|policy.
     # `gfn_gflownet` selects config/gflownet/<name>.yaml, the three must stay in sync.
     gfn_n_train_steps: int = 500
+    gfn_batch_size: int = 10   # forward trajectories per training step (gflownet)
     gfn_gflownet: str = "trajectorybalance"
     gfn_loss: str = "trajectorybalance"
     gfn_policy: str = "mlp_trajectorybalance"
@@ -339,6 +340,7 @@ def gfn_train(config: ALConfig, models_dir: Path, log_dir: Path, total_steps: in
         f"loss={config.gfn_loss}",
         f"policy={config.gfn_policy}",
         f"gflownet.optimizer.n_train_steps={total_steps}",
+        f"gflownet.optimizer.batch_size.forward={config.gfn_batch_size}",
         f"n_samples=0",
         f"hydra.run.dir={_hydra_run_dir(log_dir)}",
         f"seed={config.seed}",

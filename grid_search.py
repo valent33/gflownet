@@ -61,6 +61,16 @@ SEARCH_GRID = {
 # irrelevant to them, so we pick a single valid value instead of sweeping).
 GFN_DEFAULT_LOSS = "trajectorybalance"
 
+# GFN training budget: (batch_size, n_train_steps). Pairs are kept together
+# (no cross product) because each is a complete schedule: both use 10k total
+# on-policy trajectories, but differ in update count vs. per-update gradient
+# noise. Swept only for the gflownet strategy.
+GFN_BUDGET_COMBOS = [
+    (10, 1000),   # 10 trajectories/step x 1000 updates
+    (100, 100),   # 100 trajectories/step x 100 updates
+]
+GFN_DEFAULT_BUDGET = GFN_BUDGET_COMBOS[0]  # used for non-gflownet strategies
+
 # gfn_loss -> matching `gflownet` config group (config/gflownet/<name>.yaml)
 LOSS_TO_GFN = {
     "detailedbalance": "detailedbalance",
@@ -89,6 +99,7 @@ FIXED_CONFIG = {
     "ml_retrain_every":    1,
     "diverse_top_k_lambda": 0.3,
     "gfn_n_train_steps":   1000,
+    "gfn_batch_size":      10,
     "n_candidates":       100,
     "gfn_gflownet":        "trajectorybalance",
     "gfn_loss":            "trajectorybalance",
@@ -117,24 +128,28 @@ def generate_combos():
 
     combos = []
     for base in base_combos:
-        # Sweep the GFN loss only for the gflownet strategy; other strategies
-        # get a single fixed value since GFN params don't affect them.
-        losses = (SEARCH_GRID["gfn_loss"]
-                  if base["sampling_strategy"] == "gflownet"
-                  else [GFN_DEFAULT_LOSS])
+        is_gfn = base["sampling_strategy"] == "gflownet"
+        # GFN loss: swept only for gflownet; fixed default otherwise.
+        losses = SEARCH_GRID["gfn_loss"] if is_gfn else [GFN_DEFAULT_LOSS]
+        # GFN training budget (batch, steps): paired, not crossed; only swept
+        # for gflownet, fixed default otherwise.
+        gfn_budgets = GFN_BUDGET_COMBOS if is_gfn else [GFN_DEFAULT_BUDGET]
         for loss in losses:
             for n_init, n_cand, n_iter in BUDGET_COMBOS:
-                combo = {
-                    **base,
-                    "n_init": n_init,
-                    "n_candidates_per_iter": n_cand,
-                    "n_iterations": n_iter,
-                    "gfn_loss": loss,
-                    "gfn_gflownet": LOSS_TO_GFN[loss],
-                    "gfn_policy": LOSS_TO_POLICY[loss],
-                }
-                if is_valid(combo):
-                    combos.append(combo)
+                for gfn_batch, gfn_steps in gfn_budgets:
+                    combo = {
+                        **base,
+                        "n_init": n_init,
+                        "n_candidates_per_iter": n_cand,
+                        "n_iterations": n_iter,
+                        "gfn_loss": loss,
+                        "gfn_gflownet": LOSS_TO_GFN[loss],
+                        "gfn_policy": LOSS_TO_POLICY[loss],
+                        "gfn_batch_size": gfn_batch,
+                        "gfn_n_train_steps": gfn_steps,
+                    }
+                    if is_valid(combo):
+                        combos.append(combo)
     return combos
 
 def run_name(combo: dict, idx: int) -> str:
