@@ -39,15 +39,6 @@ REWARD_FNS = {
 # Grid search settings
 # ---------------------------------------------------------------------------
 
-BUDGET_COMBOS = [
-    # (n_init, n_candidates_per_iter, n_iterations)  -> total oracle evals
-    (50,  20, 15),   # 350
-    (200, 10, 15),   # 350
-    (275, 5, 15),   # 350
-    # (100, 5,  15),   # 175
-    # (25,  10, 15),   # 175
-]
-
 SEARCH_GRID = {
     "sampling_strategy": ["gflownet", "random", "lhs", "grid", "gp", "genetic"],
     "acquisition":       ["top_k", "diverse_top_k"],
@@ -57,18 +48,20 @@ SEARCH_GRID = {
     "gfn_loss":          ["detailedbalance", "trajectorybalance", "flowmatching", "forwardlooking"],
 }
 
-# Fixed loss used for non-gflownet strategies (GFN hyperparameters are
-# irrelevant to them, so we pick a single valid value instead of sweeping).
-GFN_DEFAULT_LOSS = "trajectorybalance"
-
-# GFN training budget: (batch_size, n_train_steps). Pairs are kept together
-# (no cross product) because each is a complete schedule: both use 10k total
-# on-policy trajectories, but differ in update count vs. per-update gradient
-# noise. Swept only for the gflownet strategy.
-GFN_BUDGET_COMBOS = [
-    (10, 1000),   # 10 trajectories/step x 1000 updates
-    (100, 100),   # 100 trajectories/step x 100 updates
+# (n_init, n_candidates_per_iter, n_iterations)  -> total oracle evals
+BUDGET_COMBOS = [
+    (50,  20, 15),   # 350
+    (200, 10, 15),   # 350
+    (275, 5, 15),   # 350
 ]
+
+# GFN training budget: (batch_size, n_train_steps)
+GFN_BUDGET_COMBOS = [
+    (10, 1000),
+    (100, 100),
+]
+
+GFN_DEFAULT_LOSS = "trajectorybalance"
 GFN_DEFAULT_BUDGET = GFN_BUDGET_COMBOS[0]  # used for non-gflownet strategies
 
 # gfn_loss -> matching `gflownet` config group (config/gflownet/<name>.yaml)
@@ -78,7 +71,6 @@ LOSS_TO_GFN = {
     "flowmatching": "flowmatch",
     "forwardlooking": "forwardlooking",
     "vargrad": "vargrad",
-    # "base": "gflownet",
 }
 
 # gfn_loss -> matching `policy` config group (config/policy/<name>.yaml)
@@ -88,7 +80,6 @@ LOSS_TO_POLICY = {
     "flowmatching": "mlp_flowmatch",
     "forwardlooking": "mlp_forwardlooking",
     "vargrad": "mlp_vargrad",
-    # "base": "multihead_tree",
 }
 
 FIXED_CONFIG = {
@@ -98,9 +89,9 @@ FIXED_CONFIG = {
     "ml_model_name":       "XGBoost",
     "ml_retrain_every":    1,
     "diverse_top_k_lambda": 0.3,
+    "n_candidates":       100,
     "gfn_n_train_steps":   1000,
     "gfn_batch_size":      10,
-    "n_candidates":       100,
     "gfn_gflownet":        "trajectorybalance",
     "gfn_loss":            "trajectorybalance",
     "gfn_policy":          LOSS_TO_POLICY["trajectorybalance"],
