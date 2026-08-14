@@ -213,6 +213,19 @@ def main():
     parser.add_argument("--output-dir", type=str, default=FIXED_CONFIG["output_dir"])
     args = parser.parse_args()
 
+    # write txt file with the grid search settings
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "grid_search_settings.txt", "w") as f:
+        f.write("SEARCH_GRID:\n")
+        json.dump(SEARCH_GRID, f, indent=2)
+        f.write("\n\nFIXED_CONFIG:\n")
+        json.dump(FIXED_CONFIG, f, indent=2)
+        f.write("\n\nBUDGET_COMBOS:\n")
+        json.dump(BUDGET_COMBOS, f, indent=2)
+        f.write("\nGFN_BUDGET_COMBOS:\n")
+        json.dump(GFN_BUDGET_COMBOS, f, indent=2)
+
     combos = generate_combos()
     if args.only:
         combos = [c for c in combos if c["sampling_strategy"] == args.only]
