@@ -41,18 +41,18 @@ REWARD_FNS = {
 
 SEARCH_GRID = {
     "sampling_strategy": ["gflownet", "random", "lhs", "grid", "gp", "genetic"],
-    "acquisition":       ["top_k", "diverse_top_k"],
+    "acquisition":       ["top_k"], # diverse_top_k, 
     "reward_fn_name":    ["reward_peak", "reward_latent"],
     "seed":              [123, 456, 789],
-    "init_method":       ["latin_hypercube", "random"],
-    "gfn_loss":          ["detailedbalance", "trajectorybalance", "flowmatching", "forwardlooking"],
+    "init_method":       ["random"], # latin_hypercube", "grid", 
+    "gfn_loss":          ["trajectorybalance"], # "detailedbalance", "flowmatching", "forwardlooking", 
 }
 
 # (n_init, n_candidates_per_iter, n_iterations)  -> total oracle evals
 BUDGET_COMBOS = [
-    (50,  20, 15),   # 350
-    (200, 10, 15),   # 350
-    (275, 5, 15),   # 350
+    (50,  20, 50),   # 1050
+    (550, 10, 50),   # 1050
+    # (275, 5, 50),   # 350
 ]
 
 # GFN training budget: (batch_size, n_train_steps)
