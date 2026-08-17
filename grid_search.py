@@ -27,12 +27,13 @@ PHASE1_SRC = Path(__file__).resolve().parent.parent / "Phase1" / "src"
 if str(PHASE1_SRC) not in sys.path:
     sys.path.insert(0, str(PHASE1_SRC))
 
-from reward import reward_peak, reward_latent
+from reward import reward_peak, reward_latent, reward_peak_new
 from VEM import oracle_fn
 
 REWARD_FNS = {
     "reward_latent": reward_latent,
     "reward_peak": reward_peak,
+    "reward_peak_new": reward_peak_new,
 }
 
 # ---------------------------------------------------------------------------
@@ -42,7 +43,7 @@ REWARD_FNS = {
 SEARCH_GRID = {
     "sampling_strategy": ["gflownet", "random", "lhs", "grid", "gp", "genetic"],
     "acquisition":       ["top_k"], # diverse_top_k, 
-    "reward_fn_name":    ["reward_peak", "reward_latent"],
+    "reward_fn_name":    ["reward_peak_new"], # "reward_peak", "reward_latent"
     "seed":              [123, 456, 789],
     "init_method":       ["random"], # latin_hypercube", "grid", 
     "gfn_loss":          ["trajectorybalance"], # "detailedbalance", "flowmatching", "forwardlooking", 

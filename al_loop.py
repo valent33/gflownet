@@ -173,28 +173,57 @@ def _full_dataset_df(
 # ---------------------------------------------------------------------------
 
 def acquire(candidates: pd.DataFrame, rewards: np.ndarray, k: int,
-            strategy: str, lam: float) -> pd.DataFrame:
+            strategy: str, lam: float,
+            X_all: pd.DataFrame = None) -> pd.DataFrame:
     if strategy == "top_k":
         idx = np.argsort(rewards)[::-1][:k]
         return candidates.iloc[idx].reset_index(drop=True)
 
     elif strategy == "diverse_top_k":
-        X_enc = np.column_stack([
-            pd.factorize(candidates[col].astype(str))[0]
+        # Shared categorical encoding so candidates and the already-evaluated
+        # points (X_all) live in the same coordinate space. Diversity is then
+        # measured against BOTH the picks of this batch and everything that was
+        # evaluated in previous iterations, so the selection fills holes in the
+        # dataset instead of re-proposing the same region every iteration.
+        cats_by_col = {
+            col: pd.concat(
+                [candidates[col].astype(str)]
+                + ([X_all[col].astype(str)] if X_all is not None else [])
+            ).unique()
             for col in candidates.columns
-        ])
-        X_norm = X_enc / (X_enc.max(axis=0) + 1e-9)
+        }
+
+        def _encode(df: pd.DataFrame) -> np.ndarray:
+            cols = []
+            for col in candidates.columns:
+                codes = pd.Categorical(
+                    df[col].astype(str), categories=cats_by_col[col]
+                ).codes
+                cols.append(np.clip(codes, 0, None))
+            return np.column_stack(cols)
+
+        X_enc = _encode(candidates)
+        known_enc = _encode(X_all) if X_all is not None else np.empty((0, X_enc.shape[1]))
+        # Normalise with a single shared scale so candidates and X_all compare
+        # on the same axis.
+        colmax = X_enc.max(axis=0)
+        if known_enc.size:
+            colmax = np.maximum(colmax, known_enc.max(axis=0))
+        colmax = colmax + 1e-9
+        X_norm = X_enc / colmax
+        known = known_enc / colmax if known_enc.size else np.empty((0, X_enc.shape[1]))
+
         r_norm = (rewards - rewards.min()) / (rewards.max() - rewards.min() + 1e-9)
         selected, remaining = [], list(range(len(candidates)))
         for _ in range(k):
             if not remaining:
                 break
-            if not selected:
+            sel_mat = np.vstack([known, X_norm[selected]]) if selected else known
+            if sel_mat.shape[0] == 0:
                 best = max(remaining, key=lambda i: r_norm[i])
             else:
-                sel_mat = X_norm[selected]
                 best = max(remaining, key=lambda i:
-                    lam * r_norm[i] - (1-lam) * float(np.max(
+                    lam * r_norm[i] - (1 - lam) * float(np.max(
                         1 - np.abs(X_norm[i] - sel_mat).mean(axis=1))))
             selected.append(best)
             remaining.remove(best)
@@ -431,6 +460,10 @@ def run_al_loop(
     out = _next_run_dir(config.output_dir)
     run_name = out.name
     out.mkdir(parents=True, exist_ok=True)
+    # Save the proxy under the run dir so each run keeps its own latest model
+    # (otherwise sequential/concurrent runs overwrite each other's proxy on
+    # disk). Both the metadata file and models_dir pick up the per-run path.
+    config.proxy_models_path = str(out / "proxy")
     logger = ALLogger(out / "al_metrics.csv")
     logger.save_metadata(config)
     models_dir = Path(config.proxy_models_path).resolve()
@@ -533,7 +566,7 @@ def run_al_loop(
         y_pred = predict_with_model(model, candidates, x_pipeline, y_scaler)
         pred_rewards = reward_fn(y_pred)
         selected = acquire(candidates, pred_rewards, config.n_candidates_per_iter,
-                           config.acquisition, config.diverse_top_k_lambda)
+                           config.acquisition, config.diverse_top_k_lambda, X_all)
 
         # Oracle evaluation
         print(f"  [Oracle] Evaluating {len(selected)} candidates...")

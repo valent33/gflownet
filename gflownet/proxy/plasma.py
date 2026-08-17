@@ -8,12 +8,13 @@ if str(PHASE1_SRC) not in sys.path:
     sys.path.insert(0, str(PHASE1_SRC))
 
 from space import GFLOWNET_ENV
-from reward import reward_peak, reward_latent
+from reward import reward_peak, reward_latent, reward_peak_new
 from machinelearning import predict_with_model, preprocess
 
 REWARD_FNS = {
     "reward_peak": reward_peak,
     "reward_latent": reward_latent,
+    "reward_peak_new": reward_peak_new,
 }
 
 from typing import List, Union
