@@ -260,6 +260,8 @@ def gp_propose(config: ALConfig, space: Space, X_all: pd.DataFrame, y_all: np.nd
         kernel=kernel, normalize_y=True, n_restarts_optimizer=2, random_state=seed
     )
     gp.fit(X_feat, y_reward)
+    # Persist the fitted surrogate so post-training sampling can reuse it.
+    pickle.dump(gp, open(Path(config.proxy_models_path) / "gp_last.pkl", "wb"))
 
     pool_size = config.n_candidates * config.gp_pool_multiplier
     pool = space.to_dataframe(
@@ -280,7 +282,7 @@ def gp_propose(config: ALConfig, space: Space, X_all: pd.DataFrame, y_all: np.nd
 # ---------------------------------------------------------------------------
 def genetic_propose(config: ALConfig, space: Space, X_all: pd.DataFrame, y_all: np.ndarray,
                      reward_fn: Callable, model, x_pipeline, y_scaler,
-                     seed: int = None) -> pd.DataFrame:
+                     seed: int = None, n_population: int = None) -> pd.DataFrame:
     """
     Evolve a population of candidates toward higher predicted reward, using
     the current ML proxy as the fitness function. The initial population is
@@ -288,7 +290,9 @@ def genetic_propose(config: ALConfig, space: Space, X_all: pd.DataFrame, y_all: 
     random individuals for diversity.
     """
     rng = np.random.default_rng(seed)
-    population_size = config.n_candidates
+    # n_population lets post-training sampling scale the evolution beyond the
+    # loop's n_candidates pool (defaults to the loop behaviour).
+    population_size = config.n_candidates if n_population is None else n_population
 
     rewards_so_far = reward_fn(y_all)
     n_seed = max(1, population_size // 4)
