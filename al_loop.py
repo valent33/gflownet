@@ -32,7 +32,7 @@ import time
 import random
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -60,8 +60,13 @@ class ALConfig:
     n_candidates_per_iter: int = 10
 
     # Sampling strategy: gflownet | random | lhs | grid | gp | genetic
-    # The `phase` column in al_metrics.csv records this value per iteration.
-    sampling_strategy: str = "gflownet"
+    # Fixed strategy string, OR a mid-course schedule: dict / ordered list of
+    # single-key dicts mapping strategy name -> iteration count, e.g.
+    # {"grid": 10, "gflownet": 15, "genetic": 5}. Total iterations is derived
+    # from the schedule and overrides n_iterations when a schedule is given.
+    sampling_strategy: Union[str, list] = field(
+        default_factory=lambda: [{"lhs": 10}, {"gflownet": 15}, {"genetic": 5}]
+    )  
     n_candidates: int = 100          # pool drawn before acquisition
 
     # Acquisition: top_k | diverse_top_k
@@ -167,6 +172,33 @@ def _full_dataset_df(
     df["selection_iteration"] = iteration_all
     df["run"] = run_name
     return df
+
+def _expand_schedule(sampling_strategy, n_iterations: int) -> list:
+    """Flatten sampling_strategy into a per-iteration list of strategy names.
+
+    Accepts the legacy single string (repeated n_iterations times), a dict
+    schedule, or a list of single-key dicts — order is preserved either way:
+    {"grid": 10, "gflownet": 15, "genetic": 5}
+    [{"grid": 10}, {"gflownet": 15}, {"genetic": 5}]
+    """
+    if isinstance(sampling_strategy, str):
+        return [sampling_strategy] * n_iterations
+
+    if isinstance(sampling_strategy, dict):
+        phases = list(sampling_strategy.items())
+    elif isinstance(sampling_strategy, list):
+        phases = []
+        for entry in sampling_strategy:
+            if not isinstance(entry, dict) or len(entry) != 1:
+                raise ValueError("Schedule list entries must be single-key dicts")
+            phases.extend(entry.items())
+    else:
+        raise ValueError(f"Unsupported sampling_strategy type: {type(sampling_strategy)}")
+
+    expanded = []
+    for name, count in phases:
+        expanded.extend([name] * int(count))
+    return expanded
 
 # ---------------------------------------------------------------------------
 # Acquisition
@@ -461,6 +493,9 @@ def run_al_loop(
     np.random.seed(config.seed)
     random.seed(config.seed)
 
+    strategy_schedule = _expand_schedule(config.sampling_strategy, config.n_iterations)
+    n_iterations = len(strategy_schedule)
+
     out = _next_run_dir(config.output_dir)
     run_name = out.name
     out.mkdir(parents=True, exist_ok=True)
@@ -473,7 +508,7 @@ def run_al_loop(
     models_dir = Path(config.proxy_models_path).resolve()
 
     print(f"\n{'='*60}")
-    print(f"AL: {run_name}  |  {config.sampling_strategy}  |  {config.n_iterations} iters")
+    print(f"AL: {run_name}  |  {strategy_schedule}  |  {n_iterations} iters")
     print(f"{'='*60}\n")
 
     space = Space(_get_env())
@@ -490,10 +525,11 @@ def run_al_loop(
     X_all, y_all = initial_X.copy(), initial_y.copy()
     iteration_all = np.zeros(len(X_all), dtype=int)   # <-- add this: init pool = iteration 0
     model = x_pipeline = y_scaler = None
-    gfn_rundir = out / "gflownet"
+    gfn_rundir = None
+    gfn_phase_idx = -1
     gfn_target_steps = config.gfn_n_train_steps
-    # Resume steps proportional to initial training budget.
     effective_resume_steps = max(1, config.gfn_n_train_steps // 5)
+    prev_strategy = None
     oracle_evals_total = len(X_all)
     cumulative_best_reward = float(reward_fn(y_all).max())
 
@@ -510,9 +546,12 @@ def run_al_loop(
                proxy_mae=None,
                sampling_strategy="init")
 
-    for it in range(1, config.n_iterations + 1):
+    for it in range(1, n_iterations + 1):
         t0 = time.time()
-        print(f"\n--- Iteration {it}/{config.n_iterations} ---")
+        current_strategy = strategy_schedule[it - 1]
+        phase_changed = current_strategy != prev_strategy
+        prev_strategy = current_strategy
+        print(f"\n--- Iteration {it}/{n_iterations} ({current_strategy}) ---")
 
         # Retrain ML
         if model is None or (it - 1) % config.ml_retrain_every == 0:
@@ -535,35 +574,32 @@ def run_al_loop(
             proxy_r2 = proxy_mae = None
 
         # Sample candidates
-        if config.sampling_strategy == "gflownet":
-            if not gfn_rundir.exists():
-                print("[GFN] Training from scratch...")
-                gfn_train(
-                    config,
-                    models_dir,
-                    gfn_rundir,
-                    gfn_target_steps
-                )
+        if current_strategy == "gflownet":
+            if phase_changed:
+                gfn_phase_idx += 1
+                gfn_rundir = out / f"gflownet_p{gfn_phase_idx}"
+                gfn_target_steps = config.gfn_n_train_steps
+                print(f"[GFN] Fresh phase {gfn_phase_idx} on {len(X_all)} samples (steps={gfn_target_steps})...")
+                gfn_train(config, models_dir, gfn_rundir, gfn_target_steps)
             else:
                 print("[GFN] Resuming...")
                 gfn_target_steps += effective_resume_steps
                 gfn_resume(gfn_rundir, gfn_target_steps)
             candidates = gfn_sample(config, gfn_rundir)
-        elif config.sampling_strategy == "random":
+        elif current_strategy == "random":
             candidates = space.to_dataframe(space.sample_batch(config.n_candidates, strategy="random", seed=config.seed + it))
-        elif config.sampling_strategy == "lhs":
+        elif current_strategy == "lhs":
             candidates = space.to_dataframe(space.sample_batch(config.n_candidates, strategy="latin_hypercube", seed=config.seed + it))
-        elif config.sampling_strategy == "grid":
+        elif current_strategy == "grid":
             candidates = space.to_dataframe(space.sample_batch(config.n_candidates, strategy="grid", seed=config.seed + it))
-        elif config.sampling_strategy == "gp":
+        elif current_strategy == "gp":
             print(f"  [GP] Fitting surrogate on {len(X_all)} samples, proposing pool...")
             candidates = gp_propose(config, space, X_all, y_all, reward_fn, x_pipeline, seed=config.seed + it)
-        elif config.sampling_strategy == "genetic":
+        elif current_strategy == "genetic":
             print(f"  [GA] Evolving population over {config.ga_generations} generations...")
             candidates = genetic_propose(config, space, X_all, y_all, reward_fn, model, x_pipeline, y_scaler, seed=config.seed + it)
         else:
-            raise ValueError(f"Unknown sampling_strategy: {config.sampling_strategy}")
-
+            raise ValueError(f"Unknown sampling_strategy: {current_strategy}")
         candidates = _sanitize_features(candidates)
 
         # Score the sampled pool with the current proxy, then acquire the top subset
@@ -600,7 +636,7 @@ def run_al_loop(
             proxy_r2=proxy_r2,
             proxy_mae=proxy_mae,
             elapsed_sec=round(time.time() - t0, 1),
-            sampling_strategy=config.sampling_strategy,
+            sampling_strategy=current_strategy,
         )
         print(f"  Best so far: {all_rewards.max():.4f} | This iter: {actual_rewards.max():.4f} | n={len(X_all)}")
 
