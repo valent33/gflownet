@@ -40,25 +40,33 @@ REWARD_FNS = {
 # Grid search settings
 # ---------------------------------------------------------------------------
 
+# create all combinations of 2 or 4 sampling strategies totalling 60 iterations 30 each or 20¨each
+SAMPLING_STRATEGIES = ["random", "grid", "lhs", "gp", "gflownet", "genetic"]
+sampling_strategies = []
+for i in range(1, 4):
+    for combo in itertools.combinations(SAMPLING_STRATEGIES, i):
+        sampling_strategies.append({c: 60 // len(combo) for c in combo})
+
+print(f"Generated {len(sampling_strategies)} sampling strategy combos:")
 SEARCH_GRID = {
-    "sampling_strategy": ["gflownet", "random", "lhs", "grid", "gp", "genetic"],
-    "acquisition":       ["top_k"], # diverse_top_k, 
+    "sampling_strategy": sampling_strategies,
+    "acquisition":       ["top_k"], #"diverse_top_k"
     "reward_fn_name":    ["reward_peak_new"], # "reward_peak", "reward_latent"
     "seed":              [123, 456, 789],
     "init_method":       ["random"], # latin_hypercube", "grid", 
-    "gfn_loss":          ["trajectorybalance"], # "detailedbalance", "flowmatching", "forwardlooking", 
+    "gfn_loss":          ["trajectorybalance"] #, "detailedbalance", "flowmatching", "forwardlooking"
 }
 
 # (n_init, n_candidates_per_iter, n_iterations)  -> total oracle evals
 BUDGET_COMBOS = [
-    (50,  20, 50),   # 1050
-    (550, 10, 50),   # 1050
-    # (275, 5, 50),   # 350
+    (60, 10, 60),   # 660
+    (360, 5, 60),   # 660
 ]
 
 # GFN training budget: (batch_size, n_train_steps)
 GFN_BUDGET_COMBOS = [
     (10, 1000),
+    (50, 200),
     (100, 100),
 ]
 
@@ -84,12 +92,12 @@ LOSS_TO_POLICY = {
 }
 
 FIXED_CONFIG = {
-    "output_dir":          "./grid_results_2",
+    "output_dir":          "./grid_results_mix_and_match",
     "proxy_models_path":   "../Phase1/models/al",
     "proxy_model_name":    "XGBoost",
     "ml_model_name":       "XGBoost",
     "ml_retrain_every":    1,
-    "diverse_top_k_lambda": 0.3,
+    "diverse_top_k_lambda": 0.5,
     "n_candidates":       100,
     "gfn_n_train_steps":   1000,
     "gfn_batch_size":      10,
@@ -119,8 +127,16 @@ def generate_combos():
     base_combos = [dict(zip(core_keys, v)) for v in itertools.product(*core_vals)]
 
     combos = []
+    i = 0
+    j = 0
     for base in base_combos:
-        is_gfn = base["sampling_strategy"] == "gflownet"
+
+        is_gfn = base["sampling_strategy"] == "gflownet" or base["sampling_strategy"].get("gflownet", 0) > 0
+        if is_gfn:
+            print(f"Generating gflownet combos for {base}")
+            i += 1
+        else:
+            j += 1
         # GFN loss: swept only for gflownet; fixed default otherwise.
         losses = SEARCH_GRID["gfn_loss"] if is_gfn else [GFN_DEFAULT_LOSS]
         # GFN training budget (batch, steps): paired, not crossed; only swept
@@ -142,6 +158,8 @@ def generate_combos():
                     }
                     if is_valid(combo):
                         combos.append(combo)
+    print(i, "gflownet combos generated")
+    print(j, "non-gflownet combos generated")
     return combos
 
 def run_name(combo: dict, idx: int) -> str:
