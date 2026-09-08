@@ -41,6 +41,7 @@ from space import Space, GFLOWNET_ENV, PARAM_NAMES
 from reward import reward_peak, reward_latent, reward_peak_new
 from al_loop import ALConfig, gp_propose, genetic_propose, VEM_OUTPUT_COLUMNS, _sanitize_features
 from gflownet.utils.common import load_gflownet_from_rundir
+from VEM import oracle_fn, TARGET_NAMES
 
 REWARD_FNS = {
     "reward_peak": reward_peak,
@@ -170,9 +171,12 @@ def sample_and_evaluate(run_dir, n, oracle_fn, strategy=None, space=None,
 
     dg = sample_post_training(run_dir, n, strategy=strategy, space=space,
                               cfg=cfg, device=device, seed=seed)
+    dg.columns = PARAM_NAMES
     y = oracle_fn(dg, space)
     dg = pd.concat([dg, pd.DataFrame(y, columns=target_cols)], axis=1)
+    dg.columns = PARAM_NAMES + TARGET_NAMES
     dg["reward"] = reward_fn(y)
+    dg["sampling_strategy"] = strategy
     if out_csv is not None:
         dg.to_csv(out_csv, index=False)
     return dg
