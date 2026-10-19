@@ -371,3 +371,30 @@ Bibtex Format
 ```
 
 Or [CFF file](./CITATION.cff)
+
+## Plasma add-on
+
+The plasma add-on contains the custom environment and proxy used for plasma
+deposition experiments, together with scripts for active-learning runs and
+their analysis.
+
+### Plasma environment
+
+- [`gflownet/envs/plasma.py`](gflownet/envs/plasma.py) — Defines the plasma
+  deposition environment and its action space.
+- [`gflownet/proxy/plasma.py`](gflownet/proxy/plasma.py) — Defines the plasma
+  proxy and reward calculation used by the environment.
+- [`config/env/plasma.yaml`](config/env/plasma.yaml) — Configures the plasma
+  environment for GFlowNet experiments (hydra file).
+
+### Active learning scripts
+
+- [`al_loop.py`](al_loop.py) — Runs the active-learning loop.
+- [`dashydash.py`](dashydash.py) — Provides a live dashboard for
+  inspecting experiment results (AI generated).
+- [`grid_search.py`](grid_search.py) — Runs grid-search experiments over
+  active-learning configurations.
+- [`ilovevisualizations.ipynb`](ilovevisualizations.ipynb) — Notebook for
+  visualizing active-learning and sampling results.
+- [`post_sampling.py`](post_sampling.py) — Provides 
+  post-sampling analysis fonctions for each exploration strategies (AI generated).
