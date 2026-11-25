@@ -65,6 +65,20 @@ class ContinuousPlasma(GFlowNetEnv):
         self.n_dim = len(self.parameters)
         self.categorical_params = [p for p in self.parameters if p.type == "categorical"]
         self.continuous_params = [p for p in self.parameters if p.type == "continuous"]
+        self.categorical_param_indices = [
+            i for i, param in enumerate(self.parameters) if param.type == "categorical"
+        ] # 0 to 2
+        self.continuous_param_indices = [
+            i for i, param in enumerate(self.parameters) if param.type == "continuous"
+        ] # 3 to 9
+        self.param_idx_to_discrete_idx = {
+            param_idx: discrete_idx
+            for discrete_idx, param_idx in enumerate(self.categorical_param_indices)
+        } # 0 to 2; 0 to 2 yes i know it's useless
+        self.param_idx_to_continuous_idx = {
+            param_idx: continuous_idx
+            for continuous_idx, param_idx in enumerate(self.continuous_param_indices)
+        } # 3 to 9; 0 to 6
         self.n_discrete_actions = sum(len(param.get_choices()) for param in self.categorical_params)
         self.n_continuous_dims = len(self.continuous_params)
         self.min_incr = min_incr
@@ -84,23 +98,54 @@ class ContinuousPlasma(GFlowNetEnv):
         self.kappa = kappa
 
         # Source
-        self.source = [self.pad_idx] * self.max_length
-        self.eos_idx = -1
+        self.source_discrete = [self.pad_idx] * len(self.categorical_params)
+        self.source_continuous = [self.pad_idx] * self.n_continuous_dims
+        self.source = self._compose_state(self.source_discrete, self.source_continuous)
         self.continuous_action_idx = self.n_discrete_actions
         self.source_flag_idx = self.n_discrete_actions + 1
         self.eos_idx = self.n_discrete_actions + 2
         self.eos = (self.eos_idx,)
         
-        self._idx_to_value = self._build_index_to_value() 
-        self._choice_dims = [len(p.get_choices()) for p in self.parameters]
-        self._policy_dim = sum(self._choice_dims)
-        self._offsets = [sum(self._choice_dims[:i]) for i in range(self.n_dim)]
-        self._param_ranges = [self.idparam2actionrange(i) for i in range(self.n_dim)]
+        self._policy_dim = sum(
+            len(param.get_choices()) for param in self.categorical_params
+        ) + self.n_continuous_dims
         
         # Base class init
-        super().__init__(**kwargs)
+        super().__init__(
+            fixed_distr_params=fixed_distr_params,
+            random_distr_params=random_distr_params,
+            **kwargs,
+        )
         self.continuous = True
         
+    def reset(self, env_id: Union[int, str] = None):
+        self.discrete_state = copy(self.source_discrete)
+        self.continuous_state = copy(self.source_continuous)
+        return super().reset(env_id)
+
+    def set_state(self, state: List, done: Optional[bool] = False):
+        state = state.tolist() if torch.is_tensor(state) else copy(state)
+        self.discrete_state = [
+            state[param_idx] for param_idx in self.categorical_param_indices
+        ]
+        self.continuous_state = [
+            state[param_idx] for param_idx in self.continuous_param_indices
+        ]
+        return super().set_state(state, done)
+
+    def _compose_state(self, discrete_state, continuous_state):
+        state = []
+        discrete_idx = 0
+        continuous_idx = 0
+        for param in self.parameters:
+            if param.type == "categorical":
+                state.append(discrete_state[discrete_idx])
+                discrete_idx += 1
+            else:
+                state.append(continuous_state[continuous_idx])
+                continuous_idx += 1
+        return state
+
 
     def get_action_space(self):
         """Build fixed-width representatives for mixed categorical/cube actions
@@ -215,6 +260,29 @@ class ContinuousPlasma(GFlowNetEnv):
         )
         return policy_output
 
+    def _beta_params_to_policy_outputs(self, param_name: str, params_dict: dict):
+        """
+        Maps the values of alpha and beta given in the configuration to new values such
+        that when passed to _make_increments_distribution, the actual alpha and beta
+        passed to the Beta distribution(s) are the ones from the configuration.
+
+        Args
+        ----
+        param_name : str
+            Name of the parameter to transform: alpha or beta
+
+        params_dict : dict
+            Dictionary with the complete set of parameters of the distribution.
+
+        See
+        ---
+        _make_increments_distribution()
+        """
+        param_value = tfloat(
+            params_dict[f"beta_{param_name}"], float_type=self.float, device=self.device
+        )
+        return torch.logit((param_value - self.beta_params_min) / self.beta_params_max)
+
     def _get_policy_betas_weights(
         self, policy_output: TensorType["n_states", "policy_output_dim"]
     ) -> TensorType["n_states", "n_dim * n_comp"]:
@@ -224,7 +292,8 @@ class ContinuousPlasma(GFlowNetEnv):
 
         See: get_policy_output()
         """
-        return policy_output[:, 0 : self._len_policy_output_cont : 3]
+        start = self.n_discrete_actions
+        return policy_output[:, start : start + self._len_policy_output_cont : 3]
 
     def _get_policy_betas_alpha(
         self, policy_output: TensorType["n_states", "policy_output_dim"]
@@ -235,7 +304,8 @@ class ContinuousPlasma(GFlowNetEnv):
 
         See: get_policy_output()
         """
-        return policy_output[:, 1 : self._len_policy_output_cont : 3]
+        start = self.n_discrete_actions
+        return policy_output[:, start + 1 : start + self._len_policy_output_cont : 3]
 
     def _get_policy_betas_beta(
         self, policy_output: TensorType["n_states", "policy_output_dim"]
@@ -246,7 +316,8 @@ class ContinuousPlasma(GFlowNetEnv):
 
         See: get_policy_output()
         """
-        return policy_output[:, 2 : self._len_policy_output_cont : 3]
+        start = self.n_discrete_actions
+        return policy_output[:, start + 2 : start + self._len_policy_output_cont : 3]
 
     def _get_policy_eos_logit(
         self, policy_output: TensorType["n_states", "policy_output_dim"]
@@ -259,7 +330,6 @@ class ContinuousPlasma(GFlowNetEnv):
         """
         return policy_output[:, -1]
 
-        
     def _compute_mask_dim(self):
         """Return one mask entry per categorical action and three continuous flags."""
         return self.mask_dim_base
@@ -339,7 +409,7 @@ class ContinuousPlasma(GFlowNetEnv):
             for param_idx, param in enumerate(self.parameters):
                 if param.type == "categorical" and state[param_idx] != self.pad_idx:
                     start, end = self.idparam2actionrange(param_idx)
-                    action_idx = int(state[param_idx])
+                    action_idx = start + int(state[param_idx])
                     if start <= action_idx < end:
                         mask[action_idx] = False # allow removing the selected category
             return mask
@@ -411,6 +481,216 @@ class ContinuousPlasma(GFlowNetEnv):
             actions_valid.append(self.eos) # Add EOS when it is valid.
         return actions_valid
 
+    def get_parents(
+        self, state: List = None, done: bool = None, action: Tuple[int, float] = None
+    ) -> Tuple[List[List], List[Tuple[int, float]]]:
+        """
+        Defined only because it is required. A ContinuousEnv should be created to avoid
+        this issue.
+        """
+        pass
+
+    def relative_to_absolute_increments(
+        self,
+        states: TensorType["n_states", "n_dim"],
+        increments_rel: TensorType["n_states", "n_dim"],
+        is_backward: bool,
+    ):
+        """
+        Returns a batch of absolute increments (actions) given a batch of states,
+        relative increments and minimum_increments.
+
+        Given a dimension value x, a relative increment r, and a minimum increment m,
+        then the absolute increment a is given by:
+
+        Forward:
+
+        a = m + r * (1 - x - m)
+
+        Backward:
+
+        a = m + r * (x - m)
+        """
+        min_increments = torch.full_like(
+            increments_rel, self.min_incr, dtype=self.float, device=self.device
+        )
+        if is_backward:
+            return min_increments + increments_rel * (states - min_increments)
+        else:
+            return min_increments + increments_rel * (1.0 - states - min_increments)
+
+    def absolute_to_relative_increments(
+        self,
+        states: TensorType["n_states", "n_dim"],
+        increments_abs: TensorType["n_states", "n_dim"],
+        is_backward: bool,
+    ):
+        """
+        Returns a batch of relative increments (as sampled by the Beta distributions)
+        given a batch of states, absolute increments (actions) and minimum_increments.
+
+        Given a dimension value x, an absolute increment a, and a minimum increment m,
+        then the relative increment r is given by:
+
+        Forward:
+
+        r = (a - m) / (1 - x - m)
+
+        Backward:
+
+        r = (a - m) / (x - m)
+        """
+        min_increments = torch.full_like(
+            increments_abs, self.min_incr, dtype=self.float, device=self.device
+        )
+        if is_backward:
+            denominator = (states - min_increments).clamp(min=self.epsilon)
+            increments_rel = (increments_abs - min_increments) / denominator
+            return increments_rel
+        else:
+            denominator = (1.0 - states - min_increments).clamp(min=self.epsilon)
+            return (increments_abs - min_increments) / denominator
+
+    def _step(
+        self,
+        action: Tuple[float],
+        backward: bool,
+    ) -> Tuple[List[float], Tuple[float], bool]:
+        """
+        Updates self.state given a non-EOS action. This method is called by both step()
+        and step_backwards(), with the corresponding value of argument backward.
+
+        Args
+        ----
+        action : tuple
+            Action to be executed. An action is a tuple of length n_dim, with the
+            absolute increment for each dimension.
+
+        backward : bool
+            If True, perform backward step. Otherwise (default), perform forward step.
+
+        Returns
+        -------
+        self.state : list
+            The sequence after executing the action
+
+        action : int
+            Action executed
+
+        valid : bool
+            False, if the action is not allowed for the current state, e.g. stop at the
+            root state
+        """
+        if action[0] != -1: # Categorical actions
+            param_idx, choice_idx = int(action[0]), int(action[1])
+            discrete_idx = self.param_idx_to_discrete_idx[param_idx] # Convert full parameter ID to the compact category list
+            self.discrete_state[discrete_idx] = self.pad_idx if backward else choice_idx # Forward stores the choice, backward resets it
+            self.n_actions += 1
+            self.state = self._compose_state(self.discrete_state, self.continuous_state) # Rebuild state in parameter order
+            return self.state, action, True
+
+        if not backward and action[-1] == 1 and self.continuous_state == self.source_continuous: # First forward action in continuous space
+            continuous_state = [0.0] * self.n_continuous_dims # Start numeric values at zero (keep chosen categories seperate)
+        else:
+            assert action[-1] == 0 # Other continuous actions
+            continuous_state = copy(self.continuous_state)
+        for dim, increment in enumerate(action[2:-1]):
+            if backward:
+                continuous_state[dim] -= increment
+            else:
+                continuous_state[dim] += increment
+        if any(value < 0.0 or value > 1.0 for value in continuous_state):
+            return self.state, action, False # Sanity check
+        self.continuous_state = continuous_state
+        self.n_actions += 1
+        self.state = self._compose_state(self.discrete_state, self.continuous_state)
+        return self.state, action, True
+
+    def step(
+        self, action: Tuple[float]
+    ) -> Tuple[List[float], Tuple[int, float], bool]:
+        """
+        Executes step given an action. An action is a choice of a discrete variable or
+        the absolute increment of each other continuous dimension
+
+        Args
+        ----
+        action : tuple
+            Action to be executed. An action is a tuple of length n_dim, with the
+            absolute increment for each dimension.
+
+        Returns
+        -------
+        self.state : list
+            The sequence after executing the action
+
+        action : int
+            Action executed
+
+        valid : bool
+            False, if the action is not allowed for the current state, e.g. stop at the
+            root state
+        """
+        if self.done:
+            return self.state, action, False
+        if action == self.eos:
+            if (
+                any(value == self.pad_idx for value in self.discrete_state)
+                or all(value == self.pad_idx for value in self.continuous_state)
+            ):
+                return self.state, action, False # EOS requires all categories and a populated numeric state
+            self.done = True
+            self.n_actions += 1
+            return self.state, self.eos, True
+        # Otherwise perform action
+        return self._step(action, backward=False)
+
+    def step_backwards(
+        self, action: Tuple[int, float]
+    ) -> Tuple[List[float], Tuple[int, float], bool]:
+        """
+        Executes backward step given an action. An action is a choice of a discrete variable or
+        the absolute decrement of each other continuous dimension.
+
+        Args
+        ----
+        action : tuple
+            Action to be executed. An action is a tuple of length n_dim, with the
+            absolute decrement for each dimension.
+
+        Returns
+        -------
+        self.state : list
+            The sequence after executing the action
+
+        action : int
+            Action executed
+
+        valid : bool
+            False, if the action is not allowed for the current state, e.g. stop at the
+            root state
+        """
+        # If done is True, set done to False, increment n_actions and return same state
+        if self.done:
+            assert action == self.eos
+            self.done = False # Undo EOS without changing the configuration
+            self.n_actions += 1
+            return self.state, action, True
+        if action == self.eos:
+            return self.state, action, False # EOS can only be undone from a terminal state
+        if action[0] == -1 and action[-1] == 1: # Back-to-source action
+            if (
+                any(value == self.pad_idx for value in self.discrete_state)
+                or all(value == self.pad_idx for value in self.continuous_state)
+            ):
+                return self.state, action, False # Back-to-source needs selected categories and numeric values to reset.
+            self.n_actions += 1
+            self.continuous_state = copy(self.source_continuous) # Reset only numeric values, keep categories for now
+            self.state = self._compose_state(self.discrete_state, self.continuous_state)
+            return self.state, action, True
+        # Otherwise perform action
+        return self._step(action, backward=True)
+
     ############### WIP LINE ###############
 
     def idparam2actionrange(self, id_param: int) -> Tuple[int, int]:
@@ -427,40 +707,6 @@ class ContinuousPlasma(GFlowNetEnv):
         )
         end = start + len(param.get_choices())
         return start, end
-
-
-    def step(self, action: Tuple[int], skip_mask_check: bool = False):
-        do_step, self.state, action = self._pre_step(
-            action, skip_mask_check or self.skip_mask_check
-        )
-        if not do_step:
-            return self.state, action, False
-
-        self.n_actions += 1
-
-        # EOS is the actual termination signal the batch watches for
-        if action == self.eos:
-            self.done = True
-            return self.state, action, True
-
-        # fill the param
-        pos = self._get_seq_length()
-        self.state[pos] = action[0]
-
-        return self.state, action, True
-
-    def get_parents(self, state=None, done=None, action=None):
-        state = self._get_state(state)
-        done = self._get_done(done)
-        if done:
-            return [state], [self.eos]  # eos must be a tuple
-        if self.equal(state, self.source):
-            return [], []
-        pos_last_param = self._get_seq_length(state) - 1
-        parent = copy(state)
-        parent[pos_last_param] = self.pad_idx
-        p_action = (state[pos_last_param],)
-        return [parent], [p_action]
     
     def _smoke_test(self):
         """Run after __init__ to catch obvious issues early."""
@@ -501,15 +747,14 @@ class ContinuousPlasma(GFlowNetEnv):
         rows = []
         for state in states:
             row = []
-            for param_idx, global_action_idx in enumerate(state):
-                if global_action_idx == self.pad_idx:
+            for param_idx, param in enumerate(self.parameters):
+                value = state[param_idx]
+                if value == self.pad_idx:
                     row.append(None)  # shouldn't happen for terminating states
+                elif param.type == "categorical":
+                    row.append(param.decode(int(value)))
                 else:
-                    start, _ = self._param_ranges[param_idx]
-                    local_idx = global_action_idx - start
-                    choice = self.parameters[param_idx].get_choices()[local_idx]
-                    value = choice[0] if isinstance(choice, tuple) else choice
-                    row.append(value)
+                    row.append(param.decode(float(value)))
             rows.append(row)
 
         return rows
@@ -525,21 +770,31 @@ class ContinuousPlasma(GFlowNetEnv):
 
         batch_size = len(states)
         out = torch.zeros(batch_size, self._policy_dim, device=self.device)
+        n_categorical_features = sum(
+            len(param.get_choices()) for param in self.categorical_params
+        )
 
         for i, state in enumerate(states):
-            for param_idx, global_action_idx in enumerate(state):
-                if global_action_idx != self.pad_idx:
-                    start = self._param_ranges[param_idx][0]
-                    local_idx = global_action_idx - start
-                    out[i, self._offsets[param_idx] + local_idx] = 1.0
+            categorical_offset = 0
+            continuous_idx = 0
+            for param_idx, param in enumerate(self.parameters):
+                value = state[param_idx]
+                if param.type == "categorical":
+                    if value != self.pad_idx:
+                        out[i, categorical_offset + int(value)] = 1.0
+                    categorical_offset += len(param.get_choices())
+                else:
+                    out[i, n_categorical_features + continuous_idx] = float(value)
+                    continuous_idx += 1
 
         return out
 
-    def state2readable(self, state: List[int] = None) -> str:
+    def state2readable(self, state: List[int] = None) -> List:
         """
         Converts a state into a human-readable string.
         """
-        return [self._idx_to_value[idx] for idx in state if idx != self.pad_idx]
+        state = self._get_state(state)
+        return self.states2proxy([state])[0]
 
     def readable2state(self, readable: str) -> List[int]:
         """
@@ -592,14 +847,3 @@ class ContinuousPlasma(GFlowNetEnv):
         else:
             return len(state)
 
-
-    def _build_index_to_value(self):
-        """
-        Returns a flat list where index i → actual parameter value.
-        Mirrors the order of get_action_space().
-        """
-        mapping = []
-        for param in self.parameters:
-            for choice in param.get_choices():
-                mapping.append(choice)
-        return mapping
