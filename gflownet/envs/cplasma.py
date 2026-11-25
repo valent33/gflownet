@@ -40,6 +40,20 @@ class ContinuousPlasma(GFlowNetEnv):
         beta_params_max: float = 100.0,
         epsilon: float = 1e-6,
         kappa: float = 1e-3,
+        fixed_distr_params: dict = {
+            "beta_weights": 1.0,
+            "beta_alpha": 10.0,
+            "beta_beta": 10.0,
+            "bernoulli_bts_prob": 0.1,
+            "bernoulli_eos_prob": 0.1,
+        },
+        random_distr_params: dict = {
+            "beta_weights": 1.0,
+            "beta_alpha": 10.0,
+            "beta_beta": 10.0,
+            "bernoulli_bts_prob": 0.1,
+            "bernoulli_eos_prob": 0.1,
+        },
         **kwargs,
     ):
         # Main attributes
@@ -56,8 +70,8 @@ class ContinuousPlasma(GFlowNetEnv):
         self.min_incr = min_incr
         self.length_traj = length_traj
         self.max_length = self.n_dim
-
-        self.sampling_categorical = True
+        self.mask_dim_base = self.n_discrete_actions + 3  # 3 for continuous, source, eos
+        # self.sampling_categorical = True
 
         # Policy
         self.n_comp = n_comp
@@ -72,6 +86,9 @@ class ContinuousPlasma(GFlowNetEnv):
         # Source
         self.source = [self.pad_idx] * self.max_length
         self.eos_idx = -1
+        self.continuous_action_idx = self.n_discrete_actions
+        self.source_flag_idx = self.n_discrete_actions + 1
+        self.eos_idx = self.n_discrete_actions + 2
         self.eos = (self.eos_idx,)
         
         self._idx_to_value = self._build_index_to_value() 
@@ -242,15 +259,173 @@ class ContinuousPlasma(GFlowNetEnv):
         """
         return policy_output[:, -1]
 
+        
+    def _compute_mask_dim(self):
+        """Return one mask entry per categorical action and three continuous flags."""
+        return self.mask_dim_base
     
+    def get_mask_invalid_actions_forward(self, state=None, done=None):
+        """
+        The forward mask has the following structure:
+        
+        - n_discrete_actions: categorical actions are invalid if their parameter
+          has already been filled.
+        - next 3 entries: continuous action invalid, source-state flag, EOS invalid.
+        """
+        state = self._get_state(state)
+        done = self._get_done(done)
+
+        if done:
+            return [True] * self.mask_dim
+
+        mask = [False] * self.mask_dim_base
+
+        for param_idx, param in enumerate(self.parameters):
+            if param.type == "categorical" and state[param_idx] != self.pad_idx:
+                start, end = self.idparam2actionrange(param_idx)
+                for action_idx in range(start, end):
+                    mask[action_idx] = True  # mask choices for this filled parameter
+
+        continuous_dims = [
+            state[param_idx]
+            for param_idx, param in enumerate(self.parameters)
+            if param.type == "continuous"
+        ]
+        at_continuous_source = all(value == self.pad_idx for value in continuous_dims)
+        all_categorical_chosen = all(
+            state[param_idx] != self.pad_idx
+            for param_idx, param in enumerate(self.parameters)
+            if param.type == "categorical"
+        )
+
+        if not all_categorical_chosen:
+            mask[self.continuous_action_idx] = True # mask continuous sampling until categories are chosen
+            mask[self.eos_idx] = True # mask EOS until categories are chosen
+            mask[self.source_flag_idx] = True # mask the source action until categories are chosen
+        if any(value > 1 - self.min_incr for value in continuous_dims):
+            mask[self.continuous_action_idx] = True # mask increments that would overshoot
+        if all_categorical_chosen and not at_continuous_source:
+            mask[self.source_flag_idx] = True # mark that the continuous state left its source
+        if at_continuous_source:
+            mask[self.eos_idx] = True # mask EOS until a continuous increment is taken
+
+        return mask
+
+
+    def get_mask_invalid_actions_backward(self, state=None, done=None):
+        """
+        The backward mask has the following structure:
+
+        - categorical actions: only allow removing a selected category, after the
+          continuous dimensions have returned to their source.
+        - next 3 entries: continuous action invalid, back-to-source flag, EOS invalid.
+        """
+        state = self._get_state(state)
+        done = self._get_done(done)
+        mask = [True] * self.mask_dim
+
+        if done:
+            mask[self.eos_idx] = False # allow undoing EOS
+            return mask
+
+        continuous_dims = [
+            state[param_idx]
+            for param_idx, param in enumerate(self.parameters)
+            if param.type == "continuous"
+        ]
+        at_continuous_source = all(value == self.pad_idx for value in continuous_dims)
+
+        if at_continuous_source:
+            for param_idx, param in enumerate(self.parameters):
+                if param.type == "categorical" and state[param_idx] != self.pad_idx:
+                    start, end = self.idparam2actionrange(param_idx)
+                    action_idx = int(state[param_idx])
+                    if start <= action_idx < end:
+                        mask[action_idx] = False # allow removing the selected category
+            return mask
+
+        if any(value < self.min_incr for value in continuous_dims):
+            mask[self.source_flag_idx] = False # allow returning to the continuous source
+        else:
+            mask[self.continuous_action_idx] = False # allow a continuous decrement
+
+        return mask
+
+    def get_valid_actions(
+        self,
+        mask: Optional[List[bool]] = None,
+        state: Optional[List] = None,
+        done: Optional[bool] = None,
+        backward: Optional[bool] = False,
+    ) -> List[Tuple]:
+        """
+        Returns the list of non-invalid (valid, for short) according to the mask of
+        invalid actions.
+
+        As a mixed environment, the returned actions are "representatives", that
+        is the actions represented in the action space.
+
+        Parameters
+        ----------
+        mask : list (optional)
+            The mask of a state. If None, it is computed in place.
+        state : list (optional)
+            A state in GFlowNet format. If None, self.state is used.
+        done : bool (optional)
+            Whether the trajectory is done. If None, self.done is used.
+        backward : bool
+            True if the transtion is backwards; False if forward.
+
+        Returns
+        -------
+        list
+            The list of representatives of the valid actions.
+        """
+        state = self._get_state(state)
+        done = self._get_done(done)
+        if mask is None:
+            mask = self.get_mask(state, done, backward)
+
+        actions_valid = [
+            action
+            for action, is_invalid in zip(
+                self.action_space[: self.n_discrete_actions],
+                mask[: self.n_discrete_actions],
+            )
+            if not is_invalid
+        ] # Keep each categorical action allowed by its mask entry.
+        if backward:
+            if (
+                mask[self.continuous_action_idx] is False
+                or mask[self.source_flag_idx] is False
+            ):
+                actions_valid.append(self.representative_source) # Add the back-to-source action.
+            if mask[self.continuous_action_idx] is False:
+                actions_valid.append(self.representative_no_source) # Add a continuous decrement.
+        else:
+            if mask[self.source_flag_idx] is False:
+                actions_valid.append(self.representative_source) # Add the first continuous action.
+            elif mask[self.continuous_action_idx] is False:
+                actions_valid.append(self.representative_no_source) # Add a later continuous increment.
+        if mask[self.eos_idx] is False:
+            actions_valid.append(self.eos) # Add EOS when it is valid.
+        return actions_valid
+
     ############### WIP LINE ###############
 
     def idparam2actionrange(self, id_param: int) -> Tuple[int, int]:
         """
-        Returns the range of actions corresponding to a given parameter index.
+        Returns the categorical-action range for a categorical parameter index.
         """
-        start = sum(len(param.get_choices()) for param in self.parameters[:id_param])
-        end = start + len(self.parameters[id_param].get_choices())
+        param = self.parameters[id_param]
+        if param.type != "categorical":
+            raise ValueError(f"Parameter '{param.name}' is not categorical")
+        start = sum(
+            len(previous.get_choices())
+            for previous in self.parameters[:id_param]
+            if previous.type == "categorical"
+        )
+        end = start + len(param.get_choices())
         return start, end
 
 
