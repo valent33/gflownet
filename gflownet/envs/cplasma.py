@@ -3,6 +3,8 @@ Continuous Plasma environment: starting from an emtpy sequence, parameters are a
 """
 
 import sys
+
+from fastapi import params
 sys.path.append("../Phase1/src")
 from space import PLASMA_ENV
 
@@ -15,7 +17,7 @@ from torch.distributions import Categorical
 from torchtyping import TensorType
 
 from gflownet.envs.base import GFlowNetEnv
-from gflownet.utils.common import copy, tlong
+from gflownet.utils.common import copy, tfloat, tlong
 
 
 class ContinuousPlasma(GFlowNetEnv):
@@ -44,9 +46,13 @@ class ContinuousPlasma(GFlowNetEnv):
         if parameters is not None:
             self.parameters = parameters
         else:
-            self.parameters = GFLOWNET_ENV
+            self.parameters = PLASMA_ENV
         self.pad_idx = -1
         self.n_dim = len(self.parameters)
+        self.categorical_params = [p for p in self.parameters if p.type == "categorical"]
+        self.continuous_params = [p for p in self.parameters if p.type == "continuous"]
+        self.n_discrete_actions = sum(len(param.get_choices()) for param in self.categorical_params)
+        self.n_continuous_dims = len(self.continuous_params)
         self.min_incr = min_incr
         self.length_traj = length_traj
         self.max_length = self.n_dim
@@ -90,13 +96,11 @@ class ContinuousPlasma(GFlowNetEnv):
             for param_id, param in enumerate(self.parameters)
             if param.type == "categorical"
         ]
-        n_continuous_dims = sum(
-            param.type == "continuous" for param in self.parameters
-        )
-        action_dim = n_continuous_dims + 2 + 1
-        zero_increments = (0.0,) * n_continuous_dims
 
-        # discrete actions
+        action_dim = self.n_continuous_dims + 2 + 1
+        zero_increments = (0.0,) * self.n_continuous_dims
+
+        # discrete actions | maybe have only one discrete action template? idk this is confusing to me
         action_space = []
         for param_id, param in categorical_params:
             for choice_id, _ in enumerate(param.get_choices()):
@@ -128,7 +132,118 @@ class ContinuousPlasma(GFlowNetEnv):
         return action_space
 
     def action2representative(self, action):
-        pass
+        """
+        Converts an action into its representative form.
+        """
+        if action == self.eos:
+            return self.eos
+        elif action[0] == -1:
+            return self.representative_source if action[-1] == 1 else self.representative_no_source
+        return action # hopefully only correct actions are passed in
+
+    def _get_max_trajectory_length(self) -> int:
+        """
+        Returns the maximum trajectory length of the environment.
+        """
+        return int(np.ceil(1.0 / self.min_incr) + 2) + 1 + 3
+
+
+    def get_policy_output(self, params: dict) -> TensorType["policy_output_dim"]:
+        """
+        Returns the policy output dimension for the given parameters.
+        """
+        # discrete
+        categorical_logits = tfloat(
+            params.get("categorical_logits", [0.0] * self.n_discrete_actions),
+            float_type=self.float,
+            device=self.device,
+        ).flatten()
+
+        # continuous
+        self._len_policy_output_cont = self.n_continuous_dims * self.n_comp * 3
+        policy_output_cont = torch.empty(
+            self._len_policy_output_cont,
+            dtype=self.float,
+            device=self.device,
+        )
+        policy_output_cont[0::3] = params["beta_weights"]
+        policy_output_cont[1::3] = self._beta_params_to_policy_outputs("alpha", params)
+        policy_output_cont[2::3] = self._beta_params_to_policy_outputs("beta", params)
+
+
+        # Logit for Bernoulli distribution to model EOS action
+        policy_output_eos_logit = torch.logit(
+            tfloat(
+                [params["bernoulli_eos_prob"]],
+                float_type=self.float,
+                device=self.device,
+            )
+        )
+        # Logit for Bernoulli distribution to model back-to-source action
+        policy_output_bts_logit = torch.logit(
+            tfloat(
+                [params["bernoulli_bts_prob"]],
+                float_type=self.float,
+                device=self.device,
+            )
+        )
+        # Concatenate all outputs
+        policy_output = torch.cat(
+            (
+                categorical_logits,
+                policy_output_cont,
+                policy_output_bts_logit,
+                policy_output_eos_logit,
+            )
+        )
+        return policy_output
+
+    def _get_policy_betas_weights(
+        self, policy_output: TensorType["n_states", "policy_output_dim"]
+    ) -> TensorType["n_states", "n_dim * n_comp"]:
+        """
+        Reduces a given policy output to the part corresponding to the weights of the
+        mixture of Beta distributions.
+
+        See: get_policy_output()
+        """
+        return policy_output[:, 0 : self._len_policy_output_cont : 3]
+
+    def _get_policy_betas_alpha(
+        self, policy_output: TensorType["n_states", "policy_output_dim"]
+    ) -> TensorType["n_states", "n_dim * n_comp"]:
+        """
+        Reduces a given policy output to the part corresponding to the alphas of the
+        mixture of Beta distributions.
+
+        See: get_policy_output()
+        """
+        return policy_output[:, 1 : self._len_policy_output_cont : 3]
+
+    def _get_policy_betas_beta(
+        self, policy_output: TensorType["n_states", "policy_output_dim"]
+    ) -> TensorType["n_states", "n_dim * n_comp"]:
+        """
+        Reduces a given policy output to the part corresponding to the betas of the
+        mixture of Beta distributions.
+
+        See: get_policy_output()
+        """
+        return policy_output[:, 2 : self._len_policy_output_cont : 3]
+
+    def _get_policy_eos_logit(
+        self, policy_output: TensorType["n_states", "policy_output_dim"]
+    ) -> TensorType["n_states", "1"]:
+        """
+        Reduces a given policy output to the part corresponding to the logit of the
+        Bernoulli distribution to model the EOS action.
+
+        See: get_policy_output()
+        """
+        return policy_output[:, -1]
+
+    
+    ############### WIP LINE ###############
 
     def idparam2actionrange(self, id_param: int) -> Tuple[int, int]:
         """
@@ -138,26 +253,6 @@ class ContinuousPlasma(GFlowNetEnv):
         end = start + len(self.parameters[id_param].get_choices())
         return start, end
 
-    def get_mask_invalid_actions_forward(self, state=None, done=None):
-        state = self._get_state(state)
-        done = self._get_done(done)
-
-        if done:
-            return [True] * self.action_space_dim
-
-        current_param = self._get_seq_length(state)
-
-        # all params filled
-        if current_param >= self.n_dim:
-            mask = [True] * self.action_space_dim
-            mask[self.action_space.index(self.eos)] = False  # find (-1,) explicitly
-            return mask
-
-        # only allow actions for the current parameter
-        mask = [True] * self.action_space_dim
-        start, end = self.idparam2actionrange(current_param)
-        mask[start:end] = [False] * (end - start)
-        return mask
 
     def step(self, action: Tuple[int], skip_mask_check: bool = False):
         do_step, self.state, action = self._pre_step(
@@ -209,12 +304,6 @@ class ContinuousPlasma(GFlowNetEnv):
             state, action, valid = self.step(valid_actions[0])
             print(f"    → state: {state}, done: {self.done}")
         print(f"Final state: {self.state}, done: {self.done}")
-
-    def _get_max_trajectory_length(self) -> int:
-        """
-        Returns the maximum trajectory length of the environment.
-        """
-        return self.max_length + 1  # +1 for EOS
     
     def states2proxy(self, states):
         if torch.is_tensor(states[0]):
