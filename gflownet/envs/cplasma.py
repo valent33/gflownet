@@ -13,7 +13,7 @@ from typing import Iterable, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.distributions import Categorical
+from torch.distributions import Bernoulli, Beta, Categorical, MixtureSameFamily
 from torchtyping import TensorType
 
 from gflownet.envs.base import GFlowNetEnv
@@ -690,6 +690,374 @@ class ContinuousPlasma(GFlowNetEnv):
             return self.state, action, True
         # Otherwise perform action
         return self._step(action, backward=True)
+
+    
+    def _get_jacobian_diag(
+        self,
+        states_from: TensorType["n_states", "n_dim"],
+        is_backward: bool,
+    ):
+        """
+        Computes the diagonal of the Jacobian of the sampled actions with respect to
+        the target states.
+
+        Forward: the sampled variables are the relative increments r_f and the state
+        updates (s -> s') are:
+
+        s' = s + m + r_f(1 - s - m)
+        r_f = (s' - s - m) / (1 - s - m)
+
+        Therefore, the derivative of r_f wrt to s' is
+
+        dr_f/ds' = 1 / (1 - s - m)
+
+        Backward: the sampled variables are the relative decrements r_b and the state
+        updates (s' -> s) are:
+
+        s = s' - m - r_b(s' - m)
+        r_b = (s' - s - m) / (s' - m)
+
+        Therefore, the derivative of r_b wrt to s is
+
+        dr_b/ds = -1 / (s' - m)
+
+        We take the absolute value of the derivative (Jacobian).
+
+        The derivatives of the components of r with respect to dimensions of s or s'
+        other than itself are zero. Therefore, the Jacobian is diagonal and the
+        determinant is the product of the diagonal.
+        """
+        min_increments = torch.full_like(
+            states_from, self.min_incr, dtype=self.float, device=self.device
+        )
+        if is_backward:
+            return 1.0 / ((states_from - min_increments))
+        else:
+            return 1.0 / ((1.0 - states_from - min_increments))
+
+
+    def _make_increments_distribution(
+        self,
+        policy_outputs: TensorType["n_states", "policy_output_dim"],
+    ) -> MixtureSameFamily:
+        mix_logits = self._get_policy_betas_weights(policy_outputs).reshape(
+            -1, self.n_dim, self.n_comp
+        )
+        mix = Categorical(logits=mix_logits)
+        alphas = self._get_policy_betas_alpha(policy_outputs).reshape(
+            -1, self.n_dim, self.n_comp
+        )
+        alphas = self.beta_params_max * torch.sigmoid(alphas) + self.beta_params_min
+        betas = self._get_policy_betas_beta(policy_outputs).reshape(
+            -1, self.n_dim, self.n_comp
+        )
+        betas = self.beta_params_max * torch.sigmoid(betas) + self.beta_params_min
+        beta_distr = Beta(alphas, betas)
+        return MixtureSameFamily(mix, beta_distr)
+
+
+    def get_logprobs(
+        self,
+        policy_outputs: TensorType["n_states", "policy_output_dim"],
+        actions: Union[List, TensorType["n_states", "action_dim"]],
+        mask: TensorType["n_states", "mask_dim"],
+        states_from: List,
+        is_backward: bool,
+    ) -> TensorType["batch_size"]:
+        """
+        Computes log probabilities of actions given policy outputs and actions.
+
+        Parameters
+        ----------
+        policy_outputs : tensor
+            The output of the GFlowNet policy model.
+        mask : tensor
+            The mask containing information about invalid actions and special cases.
+        actions : list or tensor
+            The actions (absolute increments) from each state in the batch for which to
+            compute the log probability.
+        states_from : tensor
+            The states originating the actions, in GFlowNet format. They are required
+            so as to compute the relative increments and the Jacobian.
+        is_backward : bool
+            True if the actions are backward, False if the actions are forward
+            (default). Required, since the computation for forward and backward actions
+            is different.
+        """
+        if is_backward:
+            return self._get_logprobs_backward(
+                policy_outputs, actions, mask, states_from
+            )
+        else:
+            return self._get_logprobs_forward(
+                policy_outputs, actions, mask, states_from
+            )
+
+    def _get_logprobs_forward(
+        self,
+        policy_outputs: TensorType["n_states", "policy_output_dim"],
+        actions: Union[List, TensorType["n_states", "action_dim"]],
+        mask: TensorType["n_states", "mask_dim"],
+        states_from: List,
+    ) -> TensorType["batch_size"]:
+        """
+        Computes log probabilities of forward actions.
+        """
+        # Initialize variables
+        actions = tfloat(actions, float_type=self.float, device=self.device)
+        mask = torch.as_tensor(mask, dtype=torch.bool, device=self.device)
+        n_states = policy_outputs.shape[0]
+        states_from_tensor = tfloat(
+            states_from, float_type=self.float, device=self.device
+        )
+
+        # Dicrete variables
+        is_categorical = torch.isfinite(actions[:, 0]) & (actions[:, 0] >= 0)
+        logprobs_categorical = torch.zeros(
+            n_states, dtype=self.float, device=self.device
+        )
+        if torch.any(is_categorical):
+            categorical_logits = policy_outputs[
+                is_categorical, : self.n_discrete_actions
+            ].clone()
+            categorical_mask = mask[is_categorical, : self.n_discrete_actions]
+            categorical_logits[categorical_mask] = -torch.inf
+            action_indices = torch.tensor(
+                [
+                    self.idparam2actionrange(int(action[0]))[0] + int(action[1])
+                    for action in actions[is_categorical].tolist()
+                ],
+                dtype=torch.long,
+                device=self.device,
+            )
+            logprobs_categorical[is_categorical] = Categorical(
+                logits=categorical_logits
+            ).log_prob(action_indices)
+        
+        is_eos = torch.zeros(n_states, dtype=torch.bool, device=self.device)
+        logprobs_eos = torch.zeros(n_states, dtype=self.float, device=self.device)
+        logprobs_increments_rel = torch.zeros(
+            (n_states, self.n_continuous_dims), dtype=self.float, device=self.device
+        )
+        log_jacobian_diag = torch.zeros(
+            (n_states, self.n_continuous_dims), device=self.device, dtype=self.float
+        )
+        eos_tensor = tfloat(self.eos, float_type=self.float, device=self.device)
+        # Determine source states
+        is_source = ~mask[:, self.source_flag_idx]
+        # EOS is the only possible action if continuous actions are invalid.
+        is_eos_forced = mask[:, self.continuous_action_idx] & ~is_categorical
+        is_eos[is_eos_forced] = True
+        # Ensure that is_eos_forced does not include any source state
+        assert not torch.any(
+            torch.logical_and(is_source & ~is_categorical, is_eos_forced)
+        )
+        # Get sampled EOS actions and get log probs from Bernoulli distribution
+        do_eos = torch.logical_and(
+            ~is_source & ~is_categorical, ~is_eos_forced
+        )
+        if torch.any(do_eos):
+            is_eos_sampled = torch.zeros_like(do_eos)
+            is_eos_sampled[do_eos] = torch.all(actions[do_eos] == eos_tensor, dim=1)
+            is_eos[is_eos_sampled] = True
+            logits_eos = self._get_policy_eos_logit(policy_outputs)[do_eos]
+            distr_eos = Bernoulli(logits=logits_eos)
+            logprobs_eos[do_eos] = distr_eos.log_prob(
+                is_eos_sampled[do_eos].to(self.float)
+            )
+        # Get log probs of relative increments if EOS was not the sampled or forced
+        # action
+        do_increments = ~is_eos & ~is_categorical
+        if torch.any(do_increments):
+            # Get absolute increments
+            increments = actions[do_increments, 2:-1]
+            # Make sure increments are finite
+            assert torch.any(torch.isfinite(increments))
+            # Compute relative increments from absolute increments if state is not
+            # source
+            is_relative = ~is_source[do_increments]
+            if torch.any(is_relative):
+                states_from_rel = tfloat(
+                    states_from_tensor[do_increments],
+                    float_type=self.float,
+                    device=self.device,
+                )[is_relative][:, self.continuous_param_indices]
+                increments[is_relative] = self.absolute_to_relative_increments(
+                    states_from_rel,
+                    increments[is_relative],
+                    is_backward=False,
+                )
+            # Compute diagonal of the Jacobian (see _get_jacobian_diag()) if state is
+            # not source
+            is_relative = torch.logical_and(do_increments, ~is_source)
+            if torch.any(is_relative):
+                log_jacobian_diag[is_relative] = torch.log(
+                    self._get_jacobian_diag(
+                        states_from_rel,
+                        is_backward=False,
+                    )
+                )
+            # Make ignored dimensions zero
+            log_jacobian_diag = self._mask_ignored_dimensions(mask, log_jacobian_diag)
+            # Get logprobs
+            distr_increments = self._make_increments_distribution(
+                policy_outputs[do_increments]
+            )
+            # Clamp because increments of 0.0 or 1.0 would yield nan
+            logprobs_increments_rel[do_increments] = distr_increments.log_prob(
+                torch.clamp(increments, min=self.epsilon, max=(1 - self.epsilon))
+            )
+            # Sum log Jacobian across dimensions
+        log_det_jacobian = torch.sum(log_jacobian_diag, dim=1)
+        # Compute combined probabilities
+        sumlogprobs_increments = logprobs_increments_rel.sum(axis=1)
+        logprobs = (
+            logprobs_categorical
+            + logprobs_eos
+            + sumlogprobs_increments
+            + log_det_jacobian
+        )
+        return logprobs
+
+    def _get_logprobs_backward(
+        self,
+        policy_outputs: TensorType["n_states", "policy_output_dim"],
+        actions: Union[List, TensorType["n_states", "action_dim"]],
+        mask: TensorType["n_states", "mask_dim"],
+        states_from: List,
+    ) -> TensorType["batch_size"]:
+        """
+        Computes log probabilities of backward actions.
+        """
+        # Initialize variables
+        actions = tfloat(actions, float_type=self.float, device=self.device)
+        mask = torch.as_tensor(mask, dtype=torch.bool, device=self.device)
+        n_states = policy_outputs.shape[0]
+        states_from_tensor = tfloat(
+            states_from, float_type=self.float, device=self.device
+        )
+        # Discrete variables
+        is_categorical = torch.isfinite(actions[:, 0]) & (actions[:, 0] >= 0)
+        logprobs_categorical = torch.zeros(
+            n_states, dtype=self.float, device=self.device
+        )
+        if torch.any(is_categorical):
+            categorical_logits = policy_outputs[
+                is_categorical, : self.n_discrete_actions
+            ].clone()
+            categorical_mask = mask[is_categorical, : self.n_discrete_actions]
+            categorical_logits[categorical_mask] = -torch.inf
+            action_indices = torch.tensor(
+                [
+                    self.idparam2actionrange(int(action[0]))[0] + int(action[1])
+                    for action in actions[is_categorical].tolist()
+                ],
+                dtype=torch.long,
+                device=self.device,
+            )
+            logprobs_categorical[is_categorical] = Categorical(
+                logits=categorical_logits
+            ).log_prob(action_indices)
+        
+        is_bts = torch.zeros(n_states, dtype=torch.bool, device=self.device)
+        logprobs_bts = torch.zeros(n_states, dtype=self.float, device=self.device)
+        logprobs_increments_rel = torch.zeros(
+            (n_states, self.n_continuous_dims), dtype=self.float, device=self.device
+        )
+        log_jacobian_diag = torch.zeros(
+            (n_states, self.n_continuous_dims), device=self.device, dtype=self.float
+        )
+        # EOS is the only possible action only if done is True.
+        is_eos = ~mask[:, self.eos_idx]
+        # Back-to-source (BTS) is the only possible action when it is unmasked.
+        is_bts_forced = ~mask[:, self.source_flag_idx] & ~is_categorical
+        is_bts[is_bts_forced] = True
+        # Get sampled BTS actions and get log probs from Bernoulli distribution
+        do_bts = torch.logical_and(
+            ~is_bts_forced & ~is_categorical, ~is_eos
+        )
+        if torch.any(do_bts):
+            # BTS actions are equal to the originating states
+            is_bts_sampled = torch.zeros_like(do_bts)
+            is_bts_sampled[do_bts] = actions[do_bts, -1] == 1
+            is_bts[is_bts_sampled] = True
+            logits_bts = self._get_policy_source_logit(policy_outputs)[do_bts]
+            distr_bts = Bernoulli(logits=logits_bts)
+            logprobs_bts[do_bts] = distr_bts.log_prob(
+                is_bts_sampled[do_bts].to(self.float)
+            )
+        # Get log probs of relative increments if actions were neither BTS nor EOS
+        do_increments = torch.logical_and(
+            ~is_bts & ~is_eos, ~is_categorical
+        )
+        if torch.any(do_increments):
+            # Get absolute increments
+            increments = actions[do_increments, 2:-1]
+            states = states_from_tensor[do_increments][
+                :, self.continuous_param_indices
+            ]
+            # Compute absolute increments from all sampled relative increments
+            increments = self.absolute_to_relative_increments(
+                states,
+                increments,
+                is_backward=True,
+            )
+            # Make sure increments are finite
+            assert torch.all(torch.isfinite(increments))
+            # Compute diagonal of the Jacobian (see _get_jacobian_diag())
+            log_jacobian_diag[do_increments] = torch.log(
+                self._get_jacobian_diag(
+                    states_from_tensor[do_increments],
+                    is_backward=True,
+                )
+            )
+            # Make ignored dimensions zero
+            log_jacobian_diag = self._mask_ignored_dimensions(mask, log_jacobian_diag)
+            # Get logprobs
+            distr_increments = self._make_increments_distribution(
+                policy_outputs[do_increments]
+            )
+            # Clamp because increments of 0.0 or 1.0 would yield nan
+            logprobs_increments_rel[do_increments] = distr_increments.log_prob(
+                torch.clamp(increments, min=self.epsilon, max=(1 - self.epsilon))
+            )
+
+        # Sum log Jacobian across dimensions
+        log_det_jacobian = torch.sum(log_jacobian_diag, dim=1)
+        # Compute combined probabilities
+        sumlogprobs_increments = logprobs_increments_rel.sum(axis=1)
+        logprobs = (
+            logprobs_categorical
+            + logprobs_bts
+            + sumlogprobs_increments
+            + log_det_jacobian
+        )
+        # Ensure that logprobs of forced EOS are 0
+        logprobs[is_eos] = 0.0
+        return logprobs
+
+    def _get_policy_eos_logit(
+        self, policy_output: TensorType["n_states", "policy_output_dim"]
+    ) -> TensorType["n_states", "1"]:
+        """
+        Reduces a given policy output to the part corresponding to the logit of the
+        Bernoulli distribution to model the EOS action.
+
+        See: get_policy_output()
+        """
+        return policy_output[:, -1]
+
+    def _get_policy_source_logit(
+        self, policy_output: TensorType["n_states", "policy_output_dim"]
+    ) -> TensorType["n_states", "1"]:
+        """
+        Reduces a given policy output to the part corresponding to the logit of the
+        Bernoulli distribution to model the back-to-source action.
+
+        See: get_policy_output()
+        """
+        return policy_output[:, -2]
+
 
     ############### WIP LINE ###############
 
