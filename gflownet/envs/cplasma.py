@@ -2,10 +2,14 @@
 Continuous Plasma environment: starting from an emtpy sequence, parameters are added one at a time until the maximum length is reached.
 """
 
+import ast
 import sys
+from pathlib import Path
 
-from fastapi import params
-sys.path.append("../Phase1/src")
+PHASE1_SRC = Path(__file__).resolve().parents[3] / "Phase1" / "src"
+if str(PHASE1_SRC) not in sys.path:
+    sys.path.insert(0, str(PHASE1_SRC))
+
 from space import PLASMA_ENV
 
 from typing import Iterable, List, Optional, Tuple, Union
@@ -17,7 +21,7 @@ from torch.distributions import Bernoulli, Beta, Categorical, MixtureSameFamily
 from torchtyping import TensorType
 
 from gflownet.envs.base import GFlowNetEnv
-from gflownet.utils.common import copy, tfloat, tlong
+from gflownet.utils.common import copy, tbool, tfloat, tlong
 
 
 class ContinuousPlasma(GFlowNetEnv):
@@ -104,7 +108,7 @@ class ContinuousPlasma(GFlowNetEnv):
         self.continuous_action_idx = self.n_discrete_actions
         self.source_flag_idx = self.n_discrete_actions + 1
         self.eos_idx = self.n_discrete_actions + 2
-        self.eos = (self.eos_idx,)
+        self.action_dim = self.n_continuous_dims + 2 + 1
         
         self._policy_dim = sum(
             len(param.get_choices()) for param in self.categorical_params
@@ -197,17 +201,22 @@ class ContinuousPlasma(GFlowNetEnv):
         """
         Converts an action into its representative form.
         """
-        if action == self.eos:
+        if action == self.eos or all(np.isinf(a) for a in action):
             return self.eos
         elif action[0] == -1:
             return self.representative_source if action[-1] == 1 else self.representative_no_source
-        return action # hopefully only correct actions are passed in
+        return (
+            int(action[0]),
+            int(action[1]),
+            *((0.0,) * self.n_continuous_dims),
+            0,
+        )
 
     def _get_max_trajectory_length(self) -> int:
         """
         Returns the maximum trajectory length of the environment.
         """
-        return int(np.ceil(1.0 / self.min_incr) + 2) + 1 + 3
+        return int(np.ceil(1.0 / self.min_incr) + 2) + 1 + len(self.categorical_params)
 
 
     def get_policy_output(self, params: dict) -> TensorType["policy_output_dim"]:
@@ -319,17 +328,6 @@ class ContinuousPlasma(GFlowNetEnv):
         start = self.n_discrete_actions
         return policy_output[:, start + 2 : start + self._len_policy_output_cont : 3]
 
-    def _get_policy_eos_logit(
-        self, policy_output: TensorType["n_states", "policy_output_dim"]
-    ) -> TensorType["n_states", "1"]:
-        """
-        Reduces a given policy output to the part corresponding to the logit of the
-        Bernoulli distribution to model the EOS action.
-
-        See: get_policy_output()
-        """
-        return policy_output[:, -1]
-
     def _compute_mask_dim(self):
         """Return one mask entry per categorical action and three continuous flags."""
         return self.mask_dim_base
@@ -382,7 +380,7 @@ class ContinuousPlasma(GFlowNetEnv):
         return mask
 
 
-    def get_mask_invalid_actions_backward(self, state=None, done=None):
+    def get_mask_invalid_actions_backward(self, state=None, done=None, parents_a=None):
         """
         The backward mask has the following structure:
 
@@ -599,6 +597,12 @@ class ContinuousPlasma(GFlowNetEnv):
                 continuous_state[dim] -= increment
             else:
                 continuous_state[dim] += increment
+        # Clamp tiny float32 drift at boundaries
+        for dim, value in enumerate(continuous_state):
+            if -1e-6 <= value < 0.0:
+                continuous_state[dim] = 0.0
+            elif 1.0 < value <= 1.0 + 1e-6:
+                continuous_state[dim] = 1.0
         if any(value < 0.0 or value > 1.0 for value in continuous_state):
             return self.state, action, False # Sanity check
         self.continuous_state = continuous_state
@@ -731,9 +735,9 @@ class ContinuousPlasma(GFlowNetEnv):
             states_from, self.min_incr, dtype=self.float, device=self.device
         )
         if is_backward:
-            return 1.0 / ((states_from - min_increments))
+            return 1.0 / (states_from - min_increments).clamp(min=self.epsilon)
         else:
-            return 1.0 / ((1.0 - states_from - min_increments))
+            return 1.0 / (1.0 - states_from - min_increments).clamp(min=self.epsilon)
 
 
     def _make_increments_distribution(
@@ -741,19 +745,240 @@ class ContinuousPlasma(GFlowNetEnv):
         policy_outputs: TensorType["n_states", "policy_output_dim"],
     ) -> MixtureSameFamily:
         mix_logits = self._get_policy_betas_weights(policy_outputs).reshape(
-            -1, self.n_dim, self.n_comp
+            -1, self.n_continuous_dims, self.n_comp
         )
         mix = Categorical(logits=mix_logits)
         alphas = self._get_policy_betas_alpha(policy_outputs).reshape(
-            -1, self.n_dim, self.n_comp
+            -1, self.n_continuous_dims, self.n_comp
         )
         alphas = self.beta_params_max * torch.sigmoid(alphas) + self.beta_params_min
         betas = self._get_policy_betas_beta(policy_outputs).reshape(
-            -1, self.n_dim, self.n_comp
+            -1, self.n_continuous_dims, self.n_comp
         )
         betas = self.beta_params_max * torch.sigmoid(betas) + self.beta_params_min
         beta_distr = Beta(alphas, betas)
         return MixtureSameFamily(mix, beta_distr)
+
+    @staticmethod
+    def equal(state_x, state_y):
+        """Compare mixed states with float tolerance on numeric dimensions."""
+        if isinstance(state_x, list) and isinstance(state_y, list):
+            return GFlowNetEnv.isclose(state_x, state_y, atol=1e-6)
+        return GFlowNetEnv.equal(state_x, state_y)
+
+    def sample_actions_batch(
+        self,
+        policy_outputs: TensorType["n_states", "policy_output_dim"],
+        mask: Optional[TensorType["n_states", "mask_dim"]] = None,
+        states_from: List = None,
+        is_backward: Optional[bool] = False,
+        random_action_prob: Optional[float] = 0.0,
+        temperature_logits: Optional[float] = 1.0,
+    ) -> Tuple[List[Tuple], TensorType["n_states"]]:
+        """Samples a batch of mixed categorical/continuous actions."""
+        if not is_backward:
+            return self._sample_actions_batch_forward(
+                policy_outputs=policy_outputs,
+                mask=mask,
+                states_from=states_from,
+                random_action_prob=random_action_prob,
+                temperature_logits=temperature_logits,
+            )
+        else:
+            return self._sample_actions_batch_backward(
+                policy_outputs=policy_outputs,
+                mask=mask,
+                states_from=states_from,
+                random_action_prob=random_action_prob,
+                temperature_logits=temperature_logits,
+            )
+
+    def _actions_tensor_to_tuples(
+        self,
+        actions_tensor: TensorType["n_states", "action_dim"],
+        is_categorical: TensorType["n_states"],
+    ) -> List[Tuple]:
+        """Convert sampled action tensor rows to tuples with int categorical indices."""
+        actions = []
+        cat_flags = is_categorical.tolist()
+        for row, is_cat in zip(actions_tensor.tolist(), cat_flags):
+            if is_cat:
+                actions.append(
+                    (int(round(row[0])), int(round(row[1])), *row[2:-1], int(round(row[-1])))
+                )
+            else:
+                actions.append(tuple(row))
+        return actions
+
+    def _sample_actions_batch_forward(
+        self,
+        policy_outputs: TensorType["n_states", "policy_output_dim"],
+        mask: Optional[TensorType["n_states", "mask_dim"]] = None,
+        states_from: List = None,
+        random_action_prob: Optional[float] = 0.0,
+        temperature_logits: Optional[float] = 1.0,
+    ) -> List[Tuple]:
+        """Sample a batch of forward categorical, continuous, or EOS actions."""
+        mask = torch.as_tensor(mask, dtype=torch.bool, device=self.device)
+        n_states = policy_outputs.shape[0]
+        states_from_tensor = tfloat(
+            states_from, float_type=self.float, device=self.device
+        )
+        logits_sampling = self.randomize_and_temper_sampling_distribution(
+            policy_outputs, random_action_prob, temperature_logits
+        )
+
+        actions_tensor = torch.full(
+            (n_states, self.action_dim),
+            torch.inf,
+            dtype=self.float,
+            device=self.device,
+        )
+
+        is_categorical = torch.any(~mask[:, : self.n_discrete_actions], dim=1)
+        if torch.any(is_categorical):
+            cat_logits = logits_sampling[is_categorical, : self.n_discrete_actions].clone()
+            cat_mask = mask[is_categorical, : self.n_discrete_actions]
+            cat_logits[cat_mask] = -torch.inf
+            action_indices = Categorical(logits=cat_logits).sample()
+            actions_tensor[is_categorical] = self.action_space_torch[action_indices]
+
+        is_eos = torch.zeros(n_states, dtype=torch.bool, device=self.device)
+        is_source = ~mask[:, self.source_flag_idx] & ~is_categorical
+        is_eos_forced = mask[:, self.continuous_action_idx] & ~is_categorical
+        is_eos[is_eos_forced] = True
+        assert not torch.any(torch.logical_and(is_source, is_eos_forced))
+
+        do_eos = torch.logical_and(~is_source & ~is_categorical, ~is_eos_forced)
+        if torch.any(do_eos):
+            is_eos_sampled = torch.zeros_like(do_eos)
+            logits_eos = self._get_policy_eos_logit(logits_sampling)[do_eos]
+            distr_eos = Bernoulli(logits=logits_eos)
+            is_eos_sampled[do_eos] = tbool(distr_eos.sample(), device=self.device)
+            is_eos[is_eos_sampled] = True
+
+        do_increments = ~is_eos & ~is_categorical
+        if torch.any(do_increments):
+            distr_increments = self._make_increments_distribution(
+                logits_sampling[do_increments]
+            )
+            increments = torch.clamp(
+                distr_increments.sample(), min=self.epsilon, max=1.0 - self.epsilon
+            )
+            is_relative = ~is_source[do_increments]
+            if torch.any(is_relative):
+                states_from_rel = states_from_tensor[do_increments][is_relative][
+                    :, self.continuous_param_indices
+                ]
+                increments[is_relative] = self.relative_to_absolute_increments(
+                    states_from_rel,
+                    increments[is_relative],
+                    is_backward=False,
+                )
+            prefix = torch.full(
+                (increments.shape[0], 2),
+                -1.0,
+                dtype=self.float,
+                device=self.device,
+            )
+            source_flags = is_source[do_increments].to(self.float).unsqueeze(1)
+            actions_tensor[do_increments] = torch.cat(
+                (prefix, increments, source_flags), dim=1
+            )
+
+        return self._actions_tensor_to_tuples(actions_tensor, is_categorical)
+
+    def _sample_actions_batch_backward(
+        self,
+        policy_outputs: TensorType["n_states", "policy_output_dim"],
+        mask: Optional[TensorType["n_states", "mask_dim"]] = None,
+        states_from: List = None,
+        random_action_prob: Optional[float] = 0.0,
+        temperature_logits: Optional[float] = 1.0,
+    ) -> List[Tuple]:
+        """Sample a batch of backward categorical, continuous, BTS, or EOS actions."""
+        mask = torch.as_tensor(mask, dtype=torch.bool, device=self.device)
+        n_states = policy_outputs.shape[0]
+        states_from_tensor = tfloat(
+            states_from, float_type=self.float, device=self.device
+        )
+        logits_sampling = self.randomize_and_temper_sampling_distribution(
+            policy_outputs, random_action_prob, temperature_logits
+        )
+
+        actions_tensor = torch.zeros(
+            (n_states, self.action_dim), dtype=self.float, device=self.device
+        )
+
+        is_eos = ~mask[:, self.eos_idx]
+        if torch.any(is_eos):
+            actions_tensor[is_eos] = tfloat(
+                self.eos, float_type=self.float, device=self.device
+            )
+
+        is_categorical = torch.any(~mask[:, : self.n_discrete_actions], dim=1) & ~is_eos
+        if torch.any(is_categorical):
+            cat_logits = logits_sampling[is_categorical, : self.n_discrete_actions].clone()
+            cat_mask = mask[is_categorical, : self.n_discrete_actions]
+            cat_logits[cat_mask] = -torch.inf
+            action_indices = Categorical(logits=cat_logits).sample()
+            actions_tensor[is_categorical] = self.action_space_torch[action_indices]
+
+        is_bts = torch.zeros(n_states, dtype=torch.bool, device=self.device)
+        is_bts_forced = ~mask[:, self.source_flag_idx] & ~is_categorical & ~is_eos
+        is_bts[is_bts_forced] = True
+
+        do_bts = torch.logical_and(~is_bts_forced & ~is_categorical, ~is_eos)
+        if torch.any(do_bts):
+            is_bts_sampled = torch.zeros_like(do_bts)
+            logits_bts = self._get_policy_source_logit(logits_sampling)[do_bts]
+            distr_bts = Bernoulli(logits=logits_bts)
+            is_bts_sampled[do_bts] = tbool(distr_bts.sample(), device=self.device)
+            is_bts[is_bts_sampled] = True
+
+        do_increments = torch.logical_and(~is_bts & ~is_eos, ~is_categorical)
+        if torch.any(do_increments):
+            distr_increments = self._make_increments_distribution(
+                logits_sampling[do_increments]
+            )
+            increments = torch.clamp(
+                distr_increments.sample(), min=self.epsilon, max=1.0 - self.epsilon
+            )
+            states_from_rel = states_from_tensor[do_increments][
+                :, self.continuous_param_indices
+            ]
+            increments = self.relative_to_absolute_increments(
+                states_from_rel,
+                increments,
+                is_backward=True,
+            )
+            prefix = torch.full(
+                (increments.shape[0], 2),
+                -1.0,
+                dtype=self.float,
+                device=self.device,
+            )
+            zeros_flag = torch.zeros(
+                (increments.shape[0], 1), dtype=self.float, device=self.device
+            )
+            actions_tensor[do_increments] = torch.cat(
+                (prefix, increments, zeros_flag), dim=1
+            )
+
+        if torch.any(is_bts):
+            bts_cont = states_from_tensor[is_bts][:, self.continuous_param_indices]
+            prefix = torch.full(
+                (bts_cont.shape[0], 2),
+                -1.0,
+                dtype=self.float,
+                device=self.device,
+            )
+            ones_flag = torch.ones(
+                (bts_cont.shape[0], 1), dtype=self.float, device=self.device
+            )
+            actions_tensor[is_bts] = torch.cat((prefix, bts_cont, ones_flag), dim=1)
+
+        return self._actions_tensor_to_tuples(actions_tensor, is_categorical)
 
 
     def get_logprobs(
@@ -844,7 +1069,7 @@ class ContinuousPlasma(GFlowNetEnv):
         )
         eos_tensor = tfloat(self.eos, float_type=self.float, device=self.device)
         # Determine source states
-        is_source = ~mask[:, self.source_flag_idx]
+        is_source = ~mask[:, self.source_flag_idx] & ~is_categorical
         # EOS is the only possible action if continuous actions are invalid.
         is_eos_forced = mask[:, self.continuous_action_idx] & ~is_categorical
         is_eos[is_eos_forced] = True
@@ -870,9 +1095,9 @@ class ContinuousPlasma(GFlowNetEnv):
         do_increments = ~is_eos & ~is_categorical
         if torch.any(do_increments):
             # Get absolute increments
-            increments = actions[do_increments, 2:-1]
+            increments = actions[do_increments, 2:-1].clone()
             # Make sure increments are finite
-            assert torch.any(torch.isfinite(increments))
+            assert torch.all(torch.isfinite(increments))
             # Compute relative increments from absolute increments if state is not
             # source
             is_relative = ~is_source[do_increments]
@@ -897,8 +1122,6 @@ class ContinuousPlasma(GFlowNetEnv):
                         is_backward=False,
                     )
                 )
-            # Make ignored dimensions zero
-            log_jacobian_diag = self._mask_ignored_dimensions(mask, log_jacobian_diag)
             # Get logprobs
             distr_increments = self._make_increments_distribution(
                 policy_outputs[do_increments]
@@ -970,7 +1193,7 @@ class ContinuousPlasma(GFlowNetEnv):
         # EOS is the only possible action only if done is True.
         is_eos = ~mask[:, self.eos_idx]
         # Back-to-source (BTS) is the only possible action when it is unmasked.
-        is_bts_forced = ~mask[:, self.source_flag_idx] & ~is_categorical
+        is_bts_forced = ~mask[:, self.source_flag_idx] & ~is_categorical & ~is_eos
         is_bts[is_bts_forced] = True
         # Get sampled BTS actions and get log probs from Bernoulli distribution
         do_bts = torch.logical_and(
@@ -1007,12 +1230,10 @@ class ContinuousPlasma(GFlowNetEnv):
             # Compute diagonal of the Jacobian (see _get_jacobian_diag())
             log_jacobian_diag[do_increments] = torch.log(
                 self._get_jacobian_diag(
-                    states_from_tensor[do_increments],
+                    states,
                     is_backward=True,
                 )
             )
-            # Make ignored dimensions zero
-            log_jacobian_diag = self._mask_ignored_dimensions(mask, log_jacobian_diag)
             # Get logprobs
             distr_increments = self._make_increments_distribution(
                 policy_outputs[do_increments]
@@ -1137,7 +1358,9 @@ class ContinuousPlasma(GFlowNetEnv):
             states = [s.tolist() for s in states]
 
         batch_size = len(states)
-        out = torch.zeros(batch_size, self._policy_dim, device=self.device)
+        out = torch.zeros(
+            batch_size, self._policy_dim, dtype=self.float, device=self.device
+        )
         n_categorical_features = sum(
             len(param.get_choices()) for param in self.categorical_params
         )
@@ -1164,31 +1387,44 @@ class ContinuousPlasma(GFlowNetEnv):
         state = self._get_state(state)
         return self.states2proxy([state])[0]
 
-    def readable2state(self, readable: str) -> List[int]:
+    def readable2state(self, readable: Union[str, List]) -> List:
         """
-        Converts a state in readable format into the "environment format" (tensor)
+        Converts a state in readable format into the "environment format".
         """
-        pass
-        
+        values = ast.literal_eval(readable) if isinstance(readable, str) else readable
+        state = []
+        for val, param in zip(values, self.parameters):
+            if val is None:
+                state.append(self.pad_idx)
+            elif param.type == "categorical":
+                state.append(int(param.encode(val)))
+            else:
+                state.append(float(param.encode(val)))
+        return state
+
     def get_uniform_terminating_states(
-        self, n_states: int, seed: int = None
-    ) -> List[List[int]]:
+        self, n_states: int, seed: int = None, kappa: Optional[float] = None
+    ) -> List[List]:
         """
-        Constructs a batch of n states uniformly sampled in the sample space of the
-        environment.
+        Constructs a batch of n terminating states uniformly sampled in the sample
+        space of the continuous plasma environment.
         """
-        n_letters = len(self.letters)
-        n_per_length = tlong(
-            [n_letters**length for length in range(1, self.max_length + 1)],
-            device=self.device,
+        if kappa is None:
+            kappa = self.kappa
+        rng = np.random.default_rng(seed)
+        discrete_cols = [
+            rng.integers(0, len(param.get_choices()), size=n_states).tolist()
+            for param in self.categorical_params
+        ]
+        continuous_vals = rng.uniform(
+            low=kappa, high=1.0 - kappa, size=(n_states, self.n_continuous_dims)
         )
-        lengths = Categorical(logits=n_per_length.repeat(n_states, 1)).sample() + 1
-        samples = torch.randint(
-            low=1, high=n_letters + 1, size=(n_states, self.max_length)
-        )
-        for idx, length in enumerate(lengths):
-            samples[idx, length:] = 0
-        return samples.tolist()
+        states = []
+        for idx in range(n_states):
+            discrete_state = [col[idx] for col in discrete_cols]
+            continuous_state = continuous_vals[idx].tolist()
+            states.append(self._compose_state(discrete_state, continuous_state))
+        return states
 
     def _pad(self, seq_list: list):
         """

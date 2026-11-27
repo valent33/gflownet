@@ -1,0 +1,28 @@
+defaults:
+  - base
+
+_target_: gflownet.envs.cplasma.ContinuousPlasma
+
+id: cplasma
+continuous: True
+# Minimum increment per step in [0, 1]
+min_incr: 0.1
+# Number of Beta mixture components
+n_comp: 2
+# Boundary clamping constants
+kappa: 1e-3
+epsilon: 1e-6
+beta_params_min: 0.1
+beta_params_max: 100.0
+fixed_distr_params:
+  beta_weights: 1.0
+  beta_alpha: 10.0
+  beta_beta: 10.0
+  bernoulli_bts_prob: 0.1
+  bernoulli_eos_prob: 0.1
+random_distr_params:
+  beta_weights: 1.0
+  beta_alpha: 10.0
+  beta_beta: 10.0
+  bernoulli_bts_prob: 0.1
+  bernoulli_eos_prob: 0.1

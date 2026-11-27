@@ -1,0 +1,10 @@
+defaults:
+  - base
+
+_target_: gflownet.proxy.cplasma.ContinuousPlasmaRewardProxy
+
+models_path: ../Phase1/models_continuous
+
+n: 5000
+
+reward_fn: reward_peak_new
