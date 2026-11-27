@@ -66,7 +66,12 @@ class ContinuousPlasmaRewardProxy(Proxy):
                 if hydra.core.hydra_config.HydraConfig.initialized()
                 else Path.cwd()
             )
-            models_path = base_dir / models_path
+            candidate = base_dir / models_path
+            if not candidate.exists():
+                repo_candidate = Path(__file__).resolve().parents[2] / models_path
+                if repo_candidate.exists():
+                    candidate = repo_candidate
+            models_path = candidate
         models_path = models_path.resolve()
 
         self.x_pipeline = _load_first_existing(

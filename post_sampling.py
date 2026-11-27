@@ -9,7 +9,7 @@ it, `sample_post_training` returns `n` candidate configurations (same parameter
 columns as the space) drawn from that strategy's *final* state:
 
   - gflownet  : load the final checkpoint and sample n forward trajectories.
-  - random / lhs / grid : stateless, seed-deterministic draws from the space.
+  - random / lhs / grid : seed-deterministic draws from the space (pool-aware for lhs/grid).
   - gp        : reload (or re-fit) the last GP surrogate on all data, then propose
                 the top-n pool via UCB over a large LHS candidate set.
   - genetic   : reload the last proxy + full dataset, evolve a population of size n.
@@ -19,9 +19,10 @@ a CSV (features + targets + reward), mirroring the notebook cell used for GFlowN
 trajectories.
 """
 
-import sys
+from dataclasses import fields
 import json
 import pickle
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -37,11 +38,11 @@ for _p in (GFN_DIR, PHASE1_SRC):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from space import Space, GFLOWNET_ENV, PARAM_NAMES
-from reward import reward_peak, reward_latent, reward_peak_new
-from al_loop import ALConfig, gp_propose, genetic_propose, VEM_OUTPUT_COLUMNS, _sanitize_features
+from VEM import TARGET_NAMES, oracle_fn
+from al_loop import ALConfig, VEM_OUTPUT_COLUMNS, _sanitize_features, genetic_propose
 from gflownet.utils.common import load_gflownet_from_rundir
-from VEM import oracle_fn, TARGET_NAMES
+from reward import reward_latent, reward_peak, reward_peak_new
+from space import PARAM_NAMES, PLASMA_ENV, Space
 
 REWARD_FNS = {
     "reward_peak": reward_peak,
@@ -54,7 +55,20 @@ def _load_config(run_dir: Path) -> ALConfig:
     meta = Path(run_dir) / "al_config.json"
     if not meta.exists():
         return ALConfig()
-    return ALConfig(**json.loads(meta.read_text()))
+    raw = json.loads(meta.read_text())
+    valid = {f.name for f in fields(ALConfig)}
+    return ALConfig(**{k: v for k, v in raw.items() if k in valid})
+
+
+def _resolve_final_strategy(sampling_strategy) -> str:
+    """Resolve a strategy string or schedule into the final phase strategy name."""
+    if isinstance(sampling_strategy, str):
+        return sampling_strategy
+    if isinstance(sampling_strategy, dict):
+        return list(sampling_strategy.keys())[-1]
+    if isinstance(sampling_strategy, list) and sampling_strategy:
+        return list(sampling_strategy[-1].keys())[0]
+    raise ValueError(f"Unsupported sampling_strategy: {sampling_strategy}")
 
 
 def get_reward_fn(run_dir=None, cfg=None):
@@ -78,10 +92,29 @@ def _proxy_dir(run_dir: Path, cfg: ALConfig) -> Path:
     return Path(cfg.proxy_models_path).resolve()
 
 
-def _sample_gflownet(run_dir, n, device="cuda", batch_size=4096):
+def _latest_gfn_dir(run_dir: Path) -> Path:
+    """Return the latest ``gflownet_p*`` phase dir if present, else ``gflownet``."""
+    phase_dirs = []
+    for p in Path(run_dir).glob("gflownet_p*"):
+        if p.is_dir() and (p / ".hydra").exists():
+            suffix = p.name.replace("gflownet_p", "")
+            idx = int(suffix) if suffix.isdigit() else -1
+            phase_dirs.append((idx, p))
+    if phase_dirs:
+        phase_dirs.sort(key=lambda item: item[0])
+        return phase_dirs[-1][1]
+    return Path(run_dir) / "gflownet"
+
+
+def _sample_gflownet(run_dir, n, device="cpu", batch_size=4096):
+    if n <= 0:
+        return pd.DataFrame(columns=PARAM_NAMES)
+    gfn_dir = _latest_gfn_dir(Path(run_dir))
     gfn, _ = load_gflownet_from_rundir(
-        rundir=str(Path(run_dir) / "gflownet"),
-        device=device, no_wandb=True, load_last_checkpoint=True,
+        rundir=str(gfn_dir),
+        device=device,
+        no_wandb=True,
+        load_last_checkpoint=True,
     )
     env = gfn.env
     states = []
@@ -90,32 +123,36 @@ def _sample_gflownet(run_dir, n, device="cuda", batch_size=4096):
             bs = min(batch_size, n - i)
             batch, _ = gfn.sample_batch(n_forward=bs, train=False)
             states.extend(batch.get_terminating_states())
-    return _sanitize_features(pd.DataFrame([env.state2readable(s) for s in states]))
+    return _sanitize_features(
+        pd.DataFrame([env.state2readable(s) for s in states], columns=PARAM_NAMES)
+    )
 
 
 def _sample_gp(run_dir, n, cfg, space, seed):
     from sklearn.gaussian_process import GaussianProcessRegressor
-    from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel as C
+    from sklearn.gaussian_process.kernels import ConstantKernel as C, Matern, WhiteKernel
 
     pdir = _proxy_dir(run_dir, cfg)
     x_pipeline = pickle.load(open(pdir / f"x_pipeline_{cfg.proxy_model_name}.pkl", "rb"))
+    X_all, y_all = _load_dataset(run_dir)
 
     gp_path = pdir / "gp_last.pkl"
     if gp_path.exists():
         gp = pickle.load(open(gp_path, "rb"))
     else:
         # Re-fit the last surrogate on the full dataset (deterministic given seed).
-        X_all, y_all = _load_dataset(run_dir)
         X_feat = x_pipeline.transform(_sanitize_features(X_all))
         y_reward = get_reward_fn(cfg=cfg)(y_all)
         kernel = C(1.0, (1e-3, 1e3)) * Matern(nu=2.5) + WhiteKernel(noise_level=1e-2)
         gp = GaussianProcessRegressor(
-            kernel=kernel, normalize_y=True, n_restarts_optimizer=2, random_state=seed)
+            kernel=kernel, normalize_y=True, n_restarts_optimizer=2, random_state=seed
+        )
         gp.fit(X_feat, y_reward)
 
     pool_size = n * cfg.gp_pool_multiplier
     pool = _sanitize_features(
-        space.to_dataframe(space.sample_batch(pool_size, strategy="latin_hypercube", seed=seed)))
+        space.sample_batch(pool_size, existing=X_all, strategy="latin_hypercube", seed=seed)
+    )
     mu, sigma = gp.predict(x_pipeline.transform(pool), return_std=True)
     ucb = mu + cfg.gp_kappa * sigma
     return pool.iloc[np.argsort(ucb)[::-1][:n]].reset_index(drop=True)
@@ -128,18 +165,34 @@ def _sample_genetic(run_dir, n, cfg, space, seed):
     y_scaler = pickle.load(open(pdir / f"y_scaler_{cfg.proxy_model_name}.pkl", "rb"))
     X_all, y_all = _load_dataset(run_dir)
     return genetic_propose(
-        cfg, space, X_all, y_all, get_reward_fn(cfg=cfg),
-        model, x_pipeline, y_scaler, seed=seed, n_population=n)
+        cfg,
+        space,
+        X_all,
+        y_all,
+        get_reward_fn(cfg=cfg),
+        model,
+        x_pipeline,
+        y_scaler,
+        seed=seed,
+        n_population=n,
+    )
 
 
-def sample_post_training(run_dir, n, strategy=None, seed=None, space=None,
-                         cfg=None, device="cuda"):
+def sample_post_training(
+    run_dir,
+    n,
+    strategy=None,
+    seed=None,
+    space=None,
+    cfg=None,
+    device="cpu",
+):
     """Return a DataFrame of `n` configurations drawn post-training from the
-    strategy that produced `run_dir` (defaults to the run's own strategy)."""
+    strategy that produced `run_dir` (defaults to the run's final strategy)."""
     run_dir = Path(run_dir)
     cfg = cfg or _load_config(run_dir)
-    strategy = strategy or cfg.sampling_strategy
-    space = space or Space(GFLOWNET_ENV)
+    strategy = _resolve_final_strategy(strategy or cfg.sampling_strategy)
+    space = space or Space(PLASMA_ENV)
     # Reproduce the final iteration: the loop proposes with seed + iteration.
     seed = (cfg.seed + cfg.n_iterations) if seed is None else seed
 
@@ -147,8 +200,10 @@ def sample_post_training(run_dir, n, strategy=None, seed=None, space=None,
         return _sample_gflownet(run_dir, n, device=device)
     if strategy in ("random", "lhs", "grid"):
         s = {"random": "random", "lhs": "latin_hypercube", "grid": "grid"}[strategy]
+        existing = _load_dataset(run_dir)[0] if (run_dir / "dataset.csv").exists() else None
         return _sanitize_features(
-            space.to_dataframe(space.sample_batch(n, strategy=s, seed=seed)))
+            space.sample_batch(n, existing=existing, strategy=s, seed=seed)
+        )
     if strategy == "gp":
         return _sample_gp(run_dir, n, cfg, space, seed)
     if strategy == "genetic":
@@ -156,21 +211,37 @@ def sample_post_training(run_dir, n, strategy=None, seed=None, space=None,
     raise ValueError(f"Unknown strategy: {strategy}")
 
 
-def sample_and_evaluate(run_dir, n, oracle_fn, strategy=None, space=None,
-                        cfg=None, target_cols=None, out_csv=None,
-                        device="cuda", seed=None):
+def sample_and_evaluate(
+    run_dir,
+    n,
+    oracle_fn=oracle_fn,
+    strategy=None,
+    space=None,
+    cfg=None,
+    target_cols=None,
+    out_csv=None,
+    device="cpu",
+    seed=None,
+):
     """Sample n configurations, score them with the oracle + reward, and
     optionally save a CSV (features + targets + reward), mirroring the
     GFlowNet-trajectory cell."""
     run_dir = Path(run_dir)
     cfg = cfg or _load_config(run_dir)
-    strategy = strategy or cfg.sampling_strategy
-    space = space or Space(GFLOWNET_ENV)
+    strategy = _resolve_final_strategy(strategy or cfg.sampling_strategy)
+    space = space or Space(PLASMA_ENV)
     reward_fn = get_reward_fn(cfg=cfg)
     target_cols = target_cols or VEM_OUTPUT_COLUMNS
 
-    dg = sample_post_training(run_dir, n, strategy=strategy, space=space,
-                              cfg=cfg, device=device, seed=seed)
+    dg = sample_post_training(
+        run_dir,
+        n,
+        strategy=strategy,
+        space=space,
+        cfg=cfg,
+        device=device,
+        seed=seed,
+    )
     dg.columns = PARAM_NAMES
     y = oracle_fn(dg, space)
     dg = pd.concat([dg, pd.DataFrame(y, columns=target_cols)], axis=1)

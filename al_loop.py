@@ -22,6 +22,7 @@ Parameters
 All knobs live in ALConfig below.
 """
 
+import ast
 import os
 import json
 import sys
@@ -36,13 +37,15 @@ from typing import Callable, Optional, Union
 
 import numpy as np
 import pandas as pd
+import torch
+from scipy.stats import norm
 
 PHASE1_SRC = Path(__file__).resolve().parent.parent / "Phase1" / "src"
 if str(PHASE1_SRC) not in sys.path:
     sys.path.insert(0, str(PHASE1_SRC))
 
 from space import Space
-from reward import reward_peak, reward_latent
+from reward import reward_peak, reward_latent, reward_peak_new
 from machinelearning import train_single_model, predict_with_model, preprocess, build_models
 
 VEM_OUTPUT_COLUMNS = ["rugosity", "conductivity", "homogeneity", "reflectivity"]
@@ -69,9 +72,11 @@ class ALConfig:
     )  
     n_candidates: int = 100          # pool drawn before acquisition
 
-    # Acquisition: top_k | diverse_top_k
+    # Acquisition: top_k | diverse_top_k | ucb | ei | diverse_ucb | gfn_sample
     acquisition: str = "top_k"
     diverse_top_k_lambda: float = 0.5  # 1.0=exploit, 0.0=diversity
+    acq_kappa: float = 2.0
+    acq_xi: float = 0.01
 
     # ML model — any key from build_models()
     ml_model_name: str = "XGBoost"
@@ -81,15 +86,20 @@ class ALConfig:
     ml_retrain_every: int = 1
 
     # Reward function name (for logging only — pass the fn to run_al_loop)
-    reward_fn_name: str = "reward_peak"  # reward_peak | reward_latent
+    reward_fn_name: str = "reward_peak_new"  # reward_peak | reward_peak_new | reward_latent
 
-    # GFlowNet — Hydra config groups under config/gflownet|loss|policy.
+    # GFlowNet — Hydra config groups under config/env|proxy|gflownet|loss|policy.
     # `gfn_gflownet` selects config/gflownet/<name>.yaml, the three must stay in sync.
+    gfn_env: str = "cplasma"
+    gfn_proxy: str = "cplasma"
+    gfn_reward_function: str = "identity"
+    gfn_reward_function_kwargs: dict = field(default_factory=dict)
     gfn_n_train_steps: int = 500
     gfn_batch_size: int = 10   # forward trajectories per training step (gflownet)
     gfn_gflownet: str = "trajectorybalance"
     gfn_loss: str = "trajectorybalance"
     gfn_policy: str = "mlp_trajectorybalance"
+    device: str = "cpu"
     proxy_models_path: str = "../Phase1/models/al"
     proxy_model_name: str = "XGBoost"  # stem used in proxy yaml (proxy.n)
 
@@ -129,8 +139,8 @@ def _next_run_dir(output_dir: str) -> Path:
 
 
 def _get_env():
-    from space import GFLOWNET_ENV
-    return GFLOWNET_ENV
+    from space import PLASMA_ENV
+    return PLASMA_ENV
 
 
 def _to_scalar(value):
@@ -204,64 +214,142 @@ def _expand_schedule(sampling_strategy, n_iterations: int) -> list:
 # Acquisition
 # ---------------------------------------------------------------------------
 
-def acquire(candidates: pd.DataFrame, rewards: np.ndarray, k: int,
-            strategy: str, lam: float,
-            X_all: pd.DataFrame = None) -> pd.DataFrame:
+def _mixed_distance_matrix(
+    X_a: pd.DataFrame, X_b: pd.DataFrame, space: Space
+) -> np.ndarray:
+    """Normalized mixed-space L1/Hamming distance matrix in [0, 1]."""
+    if len(X_a) == 0 or len(X_b) == 0:
+        return np.zeros((len(X_a), len(X_b)), dtype=float)
+    total = np.zeros((len(X_a), len(X_b)), dtype=float)
+    for p in space.params:
+        if p.type == "continuous":
+            va = np.array([p.normalize(float(v)) for v in X_a[p.name]], dtype=float)
+            vb = np.array([p.normalize(float(v)) for v in X_b[p.name]], dtype=float)
+            total += np.abs(va[:, None] - vb[None, :])
+        else:
+            va = X_a[p.name].astype(str).to_numpy()
+            vb = X_b[p.name].astype(str).to_numpy()
+            total += (va[:, None] != vb[None, :]).astype(float)
+    return total / len(space.params)
+
+
+def _fit_reward_gp(
+    X_all: pd.DataFrame,
+    y_all: np.ndarray,
+    reward_fn: Callable,
+    x_pipeline,
+    seed: int = None,
+):
+    """Fit a Matern + WhiteKernel GP surrogate mapping featurized X -> reward."""
+    from sklearn.gaussian_process import GaussianProcessRegressor
+    from sklearn.gaussian_process.kernels import ConstantKernel as C, Matern, WhiteKernel
+
+    X_feat = x_pipeline.transform(_sanitize_features(X_all))
+    y_reward = reward_fn(y_all)
+    kernel = C(1.0, (1e-3, 1e3)) * Matern(nu=2.5) + WhiteKernel(noise_level=1e-2)
+    gp = GaussianProcessRegressor(
+        kernel=kernel, normalize_y=True, n_restarts_optimizer=2, random_state=seed
+    )
+    gp.fit(X_feat, y_reward)
+    return gp
+
+
+def _greedy_diverse_select(
+    scores: np.ndarray,
+    candidates: pd.DataFrame,
+    k: int,
+    lam: float,
+    space: Space,
+    X_all: pd.DataFrame = None,
+) -> pd.DataFrame:
+    """Greedily pick ``k`` candidates balancing normalized score and min distance."""
+    s_norm = (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
+    cand_cand_dist = _mixed_distance_matrix(candidates, candidates, space)
+    if X_all is not None and len(X_all) > 0:
+        min_dist = _mixed_distance_matrix(candidates, X_all, space).min(axis=1)
+    else:
+        min_dist = np.full(len(candidates), np.inf)
+
+    selected = []
+    remaining = list(range(len(candidates)))
+    for _ in range(min(k, len(candidates))):
+        if np.all(np.isinf(min_dist[remaining])):
+            best = max(remaining, key=lambda i: s_norm[i])
+        else:
+            best = max(
+                remaining,
+                key=lambda i: lam * s_norm[i] + (1.0 - lam) * float(min_dist[i]),
+            )
+        selected.append(best)
+        remaining.remove(best)
+        min_dist = np.minimum(min_dist, cand_cand_dist[:, best])
+    return candidates.iloc[selected].reset_index(drop=True)
+
+
+def acquire(
+    candidates: pd.DataFrame,
+    rewards: np.ndarray,
+    k: int,
+    strategy: str,
+    lam: float = 0.5,
+    X_all: pd.DataFrame = None,
+    space: Space = None,
+    x_pipeline=None,
+    y_all: np.ndarray = None,
+    reward_fn: Callable = None,
+    gp=None,
+    kappa: float = 2.0,
+    xi: float = 0.01,
+    seed: int = None,
+) -> pd.DataFrame:
+    """Select ``k`` candidates using the configured acquisition strategy."""
+    k = min(k, len(candidates))
+    if k == 0:
+        return candidates.iloc[:0].reset_index(drop=True)
+
     if strategy == "top_k":
         idx = np.argsort(rewards)[::-1][:k]
         return candidates.iloc[idx].reset_index(drop=True)
 
-    elif strategy == "diverse_top_k":
-        # Shared categorical encoding so candidates and the already-evaluated
-        # points (X_all) live in the same coordinate space. Diversity is then
-        # measured against BOTH the picks of this batch and everything that was
-        # evaluated in previous iterations, so the selection fills holes in the
-        # dataset instead of re-proposing the same region every iteration.
-        cats_by_col = {
-            col: pd.concat(
-                [candidates[col].astype(str)]
-                + ([X_all[col].astype(str)] if X_all is not None else [])
-            ).unique()
-            for col in candidates.columns
-        }
+    if strategy == "gfn_sample":
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(candidates), size=k, replace=False)
+        return candidates.iloc[idx].reset_index(drop=True)
 
-        def _encode(df: pd.DataFrame) -> np.ndarray:
-            cols = []
-            for col in candidates.columns:
-                codes = pd.Categorical(
-                    df[col].astype(str), categories=cats_by_col[col]
-                ).codes
-                cols.append(np.clip(codes, 0, None))
-            return np.column_stack(cols)
+    space = space or Space(_get_env())
+    if strategy == "diverse_top_k":
+        return _greedy_diverse_select(rewards, candidates, k, lam, space, X_all=X_all)
 
-        X_enc = _encode(candidates)
-        known_enc = _encode(X_all) if X_all is not None else np.empty((0, X_enc.shape[1]))
-        # Normalise with a single shared scale so candidates and X_all compare
-        # on the same axis.
-        colmax = X_enc.max(axis=0)
-        if known_enc.size:
-            colmax = np.maximum(colmax, known_enc.max(axis=0))
-        colmax = colmax + 1e-9
-        X_norm = X_enc / colmax
-        known = known_enc / colmax if known_enc.size else np.empty((0, X_enc.shape[1]))
+    if strategy in ("ucb", "ei", "diverse_ucb"):
+        if gp is None:
+            if X_all is None or y_all is None or reward_fn is None or x_pipeline is None:
+                raise ValueError(
+                    f"Acquisition '{strategy}' requires X_all, y_all, reward_fn, and x_pipeline"
+                )
+            gp = _fit_reward_gp(X_all, y_all, reward_fn, x_pipeline, seed=seed)
+        cand_feat = x_pipeline.transform(_sanitize_features(candidates))
+        mu, sigma = gp.predict(cand_feat, return_std=True)
 
-        r_norm = (rewards - rewards.min()) / (rewards.max() - rewards.min() + 1e-9)
-        selected, remaining = [], list(range(len(candidates)))
-        for _ in range(k):
-            if not remaining:
-                break
-            sel_mat = np.vstack([known, X_norm[selected]]) if selected else known
-            if sel_mat.shape[0] == 0:
-                best = max(remaining, key=lambda i: r_norm[i])
-            else:
-                best = max(remaining, key=lambda i:
-                    lam * r_norm[i] - (1 - lam) * float(np.max(
-                        1 - np.abs(X_norm[i] - sel_mat).mean(axis=1))))
-            selected.append(best)
-            remaining.remove(best)
-        return candidates.iloc[selected].reset_index(drop=True)
-    else:
-        raise ValueError(f"Unknown acquisition: {strategy}")
+        if strategy == "ucb":
+            ucb = mu + kappa * sigma
+            idx = np.argsort(ucb)[::-1][:k]
+            return candidates.iloc[idx].reset_index(drop=True)
+
+        if strategy == "diverse_ucb":
+            ucb = mu + kappa * sigma
+            return _greedy_diverse_select(ucb, candidates, k, lam, space, X_all=X_all)
+
+        f_best = float(reward_fn(y_all).max())
+        imp = mu - f_best - xi
+        z = np.zeros_like(mu, dtype=float)
+        pos = sigma > 1e-12
+        z[pos] = imp[pos] / sigma[pos]
+        ei = np.zeros_like(mu, dtype=float)
+        ei[pos] = imp[pos] * norm.cdf(z[pos]) + sigma[pos] * norm.pdf(z[pos])
+        idx = np.argsort(ei)[::-1][:k]
+        return candidates.iloc[idx].reset_index(drop=True)
+
+    raise ValueError(f"Unknown acquisition: {strategy}")
 
 
 # ---------------------------------------------------------------------------
@@ -273,31 +361,13 @@ def gp_propose(config: ALConfig, space: Space, X_all: pd.DataFrame, y_all: np.nd
     Fit a Gaussian Process surrogate on (featurized X -> reward) using all
     data observed so far, then propose a candidate pool via UCB acquisition
     over a large randomly-sampled set of unevaluated points.
-
-    Reuses x_pipeline (already fit on X_all for the main ML proxy this
-    iteration) purely for featurization -- keeps GP inputs consistent with
-    whatever encoding/scaling the rest of the pipeline uses.
-
-    Note: the oracle is known to be heteroscedastic / quite noisy, hence the
-    explicit WhiteKernel term -- a pure Matern kernel would overfit to noise.
     """
-    from sklearn.gaussian_process import GaussianProcessRegressor
-    from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel as C
-
-    X_feat = x_pipeline.transform(_sanitize_features(X_all))
-    y_reward = reward_fn(y_all)
-
-    kernel = C(1.0, (1e-3, 1e3)) * Matern(nu=2.5) + WhiteKernel(noise_level=1e-2)
-    gp = GaussianProcessRegressor(
-        kernel=kernel, normalize_y=True, n_restarts_optimizer=2, random_state=seed
-    )
-    gp.fit(X_feat, y_reward)
-    # Persist the fitted surrogate so post-training sampling can reuse it.
+    gp = _fit_reward_gp(X_all, y_all, reward_fn, x_pipeline, seed=seed)
     pickle.dump(gp, open(Path(config.proxy_models_path) / "gp_last.pkl", "wb"))
 
     pool_size = config.n_candidates * config.gp_pool_multiplier
-    pool = space.to_dataframe(
-        space.sample_batch(pool_size, strategy="latin_hypercube", seed=seed)
+    pool = space.sample_batch(
+        pool_size, existing=X_all, strategy="latin_hypercube", seed=seed
     )
     pool = _sanitize_features(pool)
 
@@ -332,8 +402,11 @@ def genetic_propose(config: ALConfig, space: Space, X_all: pd.DataFrame, y_all: 
     seed_pop = X_all.iloc[top_idx].reset_index(drop=True)
 
     n_fresh = max(0, population_size - len(seed_pop))
-    fresh_pop = space.to_dataframe(space.sample_batch(n_fresh, strategy="random", seed=seed))
-    population = pd.concat([seed_pop, fresh_pop], ignore_index=True)
+    if n_fresh > 0:
+        fresh_pop = space.sample_batch(n_fresh, strategy="random", seed=seed)
+        population = pd.concat([seed_pop, fresh_pop], ignore_index=True)
+    else:
+        population = seed_pop
     population = _sanitize_features(population)
 
     def _fitness(pop_df):
@@ -395,32 +468,44 @@ def _hydra_run_dir(path: Path) -> str:
 
 def gfn_train(config: ALConfig, models_dir: Path, log_dir: Path, total_steps: int) -> Path:
     log_dir = log_dir.resolve()
-    _run("train.py", [
-        "env=plasma", "proxy=plasma",
-        f"proxy.models_path={models_dir}",
+    overrides = [
+        f"env={config.gfn_env}",
+        f"proxy={config.gfn_proxy}",
+        f"proxy.models_path={models_dir.resolve().as_posix()}",
         f"proxy.n={config.proxy_model_name}",
         f"proxy.reward_fn={config.reward_fn_name}",
+        f"proxy.reward_function={config.gfn_reward_function}",
+        *[
+            f"+proxy.reward_function_kwargs.{k}={v}"
+            for k, v in config.gfn_reward_function_kwargs.items()
+        ],
         # The gflownet/loss/policy config groups must be set together
         f"gflownet={config.gfn_gflownet}",
         f"loss={config.gfn_loss}",
         f"policy={config.gfn_policy}",
         f"gflownet.optimizer.n_train_steps={total_steps}",
         f"gflownet.optimizer.batch_size.forward={config.gfn_batch_size}",
-        f"n_samples=0",
+        f"device={config.device}",
+        "logger.do.online=False",
+        "n_samples=0",
         f"hydra.run.dir={_hydra_run_dir(log_dir)}",
         f"seed={config.seed}",
-    ])
+    ]
+    _run("train.py", overrides)
     return log_dir
 
-def gfn_resume(rundir: Path, total_steps: int) -> Path:
+
+def gfn_resume(config: ALConfig, rundir: Path, total_steps: int) -> Path:
     # config/resume.yaml has no gflownet/loss/policy config groups, so those
     # cannot be overridden here: a resumed run keeps the config from its rundir.
     rundir = rundir.resolve()
 
     _run("resume.py", [
-        f"rundir={rundir}",
+        f"rundir={rundir.as_posix()}",
         f"n_train_steps={total_steps}",
         "n_samples=0",
+        f"device={config.device}",
+        "no_wandb=True",
     ])
     return rundir
 
@@ -428,31 +513,22 @@ def gfn_resume(rundir: Path, total_steps: int) -> Path:
 def gfn_sample(config: ALConfig, rundir: Path) -> pd.DataFrame:
     rundir = rundir.resolve()
     _run("eval.py", [
-        f"rundir={rundir}",
+        f"rundir={rundir.as_posix()}",
         f"n_samples={config.n_candidates}",
-        f"sampling_batch_size=256",
-        f"samples_only=True",
-        f"output_dir={rundir}",
+        "sampling_batch_size=256",
+        "samples_only=True",
+        f"output_dir={rundir.as_posix()}",
+        f"device={config.device}",
     ])
 
-    pkl = rundir / "eval" / "samples" / "gfn_samples.pkl"
-    if not pkl.exists():
-        raise FileNotFoundError(f"No samples at {pkl}")
+    csv_path = rundir / "eval" / "samples" / "gfn_samples.csv"
+    if not csv_path.exists():
+        raise FileNotFoundError(f"No samples at {csv_path}")
 
-    data = pickle.load(open(pkl, "rb"))
-    env = _get_env()
-    rows = []
-    for state in data["x"]:
-        row = {}
-        offset = 0
-        for param_idx, p in enumerate(env):
-            choices = p.get_choices()
-            local_idx = state[param_idx] - offset
-            choice = choices[local_idx]
-            row[p.name] = choice if not isinstance(choice, tuple) else choice[0]
-            offset += len(choices)
-        rows.append(row)
-    return pd.DataFrame(rows)
+    df = pd.read_csv(csv_path)
+    param_names = [p.name for p in _get_env()]
+    rows = [ast.literal_eval(r) for r in df["readable"]]
+    return pd.DataFrame(rows, columns=param_names)
 
 
 # ---------------------------------------------------------------------------
@@ -515,8 +591,10 @@ def run_al_loop(
 
     # Initial data
     if initial_X is None:
-        print(f"[Init] LHS {config.n_init} samples...")
-        initial_X = space.to_dataframe(space.sample_batch(config.n_init, strategy=config.init_method, seed=config.seed))
+        print(f"[Init] {config.init_method} {config.n_init} samples...")
+        initial_X = space.sample_batch(
+            config.n_init, strategy=config.init_method, seed=config.seed
+        )
         initial_X = _sanitize_features(initial_X)
         initial_y = oracle_fn(initial_X, space)
     else:
@@ -574,6 +652,7 @@ def run_al_loop(
             proxy_r2 = proxy_mae = None
 
         # Sample candidates
+        gfn_logz = None
         if current_strategy == "gflownet":
             if phase_changed:
                 gfn_phase_idx += 1
@@ -584,14 +663,19 @@ def run_al_loop(
             else:
                 print("[GFN] Resuming...")
                 gfn_target_steps += effective_resume_steps
-                gfn_resume(gfn_rundir, gfn_target_steps)
+                gfn_resume(config, gfn_rundir, gfn_target_steps)
+            final_ckpt = gfn_rundir / "ckpts" / "final.ckpt"
+            if final_ckpt.exists():
+                ckpt = torch.load(final_ckpt, map_location="cpu", weights_only=False)
+                if "logZ" in ckpt and ckpt["logZ"] is not None:
+                    gfn_logz = float(ckpt["logZ"].sum().item())
             candidates = gfn_sample(config, gfn_rundir)
         elif current_strategy == "random":
-            candidates = space.to_dataframe(space.sample_batch(config.n_candidates, strategy="random", seed=config.seed + it))
+            candidates = space.sample_batch(config.n_candidates, strategy="random", seed=config.seed + it)
         elif current_strategy == "lhs":
-            candidates = space.to_dataframe(space.sample_batch(config.n_candidates, strategy="latin_hypercube", seed=config.seed + it))
+            candidates = space.sample_batch(config.n_candidates, existing=X_all, strategy="latin_hypercube", seed=config.seed + it)
         elif current_strategy == "grid":
-            candidates = space.to_dataframe(space.sample_batch(config.n_candidates, strategy="grid", seed=config.seed + it))
+            candidates = space.sample_batch(config.n_candidates, existing=X_all, strategy="grid", seed=config.seed + it)
         elif current_strategy == "gp":
             print(f"  [GP] Fitting surrogate on {len(X_all)} samples, proposing pool...")
             candidates = gp_propose(config, space, X_all, y_all, reward_fn, x_pipeline, seed=config.seed + it)
@@ -605,8 +689,21 @@ def run_al_loop(
         # Score the sampled pool with the current proxy, then acquire the top subset
         y_pred = predict_with_model(model, candidates, x_pipeline, y_scaler)
         pred_rewards = reward_fn(y_pred)
-        selected = acquire(candidates, pred_rewards, config.n_candidates_per_iter,
-                           config.acquisition, config.diverse_top_k_lambda, X_all)
+        selected = acquire(
+            candidates,
+            pred_rewards,
+            config.n_candidates_per_iter,
+            config.acquisition,
+            config.diverse_top_k_lambda,
+            X_all=X_all,
+            space=space,
+            x_pipeline=x_pipeline,
+            y_all=y_all,
+            reward_fn=reward_fn,
+            kappa=config.acq_kappa,
+            xi=config.acq_xi,
+            seed=config.seed + it,
+        )
 
         # Oracle evaluation
         print(f"  [Oracle] Evaluating {len(selected)} candidates...")
@@ -635,6 +732,7 @@ def run_al_loop(
             best_predicted_reward=float(pred_rewards.max()),
             proxy_r2=proxy_r2,
             proxy_mae=proxy_mae,
+            gfn_logZ=gfn_logz,
             elapsed_sec=round(time.time() - t0, 1),
             sampling_strategy=current_strategy,
         )
@@ -646,11 +744,11 @@ def run_al_loop(
     return X_all, y_all
 
 if __name__ == "__main__":
-    from reward import reward_peak, reward_latent
+    from reward import reward_peak, reward_peak_new, reward_latent
     from space import Space
     from machinelearning import train_single_model, predict_with_model, preprocess, build_models
     from VEM import oracle_fn
 
     config = ALConfig()
 
-    run_al_loop(config, reward_fn=reward_peak, oracle_fn=oracle_fn)
+    run_al_loop(config, reward_fn=reward_peak_new, oracle_fn=oracle_fn)
