@@ -4,7 +4,6 @@ Continuous Plasma environment: starting from an emtpy sequence, parameters are a
 
 import sys
 
-from fastapi import params
 sys.path.append("../Phase1/src")
 from space import PLASMA_ENV
 
@@ -17,7 +16,7 @@ from torch.distributions import Bernoulli, Beta, Categorical, MixtureSameFamily
 from torchtyping import TensorType
 
 from gflownet.envs.base import GFlowNetEnv
-from gflownet.utils.common import copy, tfloat, tlong
+from gflownet.utils.common import copy, tbool, tfloat
 
 
 class ContinuousPlasma(GFlowNetEnv):
@@ -741,15 +740,15 @@ class ContinuousPlasma(GFlowNetEnv):
         policy_outputs: TensorType["n_states", "policy_output_dim"],
     ) -> MixtureSameFamily:
         mix_logits = self._get_policy_betas_weights(policy_outputs).reshape(
-            -1, self.n_dim, self.n_comp
+            -1, self.n_continuous_dims, self.n_comp
         )
         mix = Categorical(logits=mix_logits)
         alphas = self._get_policy_betas_alpha(policy_outputs).reshape(
-            -1, self.n_dim, self.n_comp
+            -1, self.n_continuous_dims, self.n_comp
         )
         alphas = self.beta_params_max * torch.sigmoid(alphas) + self.beta_params_min
         betas = self._get_policy_betas_beta(policy_outputs).reshape(
-            -1, self.n_dim, self.n_comp
+            -1, self.n_continuous_dims, self.n_comp
         )
         betas = self.beta_params_max * torch.sigmoid(betas) + self.beta_params_min
         beta_distr = Beta(alphas, betas)
@@ -897,8 +896,7 @@ class ContinuousPlasma(GFlowNetEnv):
                         is_backward=False,
                     )
                 )
-            # Make ignored dimensions zero
-            log_jacobian_diag = self._mask_ignored_dimensions(mask, log_jacobian_diag)
+                
             # Get logprobs
             distr_increments = self._make_increments_distribution(
                 policy_outputs[do_increments]
@@ -1007,12 +1005,11 @@ class ContinuousPlasma(GFlowNetEnv):
             # Compute diagonal of the Jacobian (see _get_jacobian_diag())
             log_jacobian_diag[do_increments] = torch.log(
                 self._get_jacobian_diag(
-                    states_from_tensor[do_increments],
+                    states,
                     is_backward=True,
                 )
             )
-            # Make ignored dimensions zero
-            log_jacobian_diag = self._mask_ignored_dimensions(mask, log_jacobian_diag)
+            
             # Get logprobs
             distr_increments = self._make_increments_distribution(
                 policy_outputs[do_increments]
@@ -1057,6 +1054,308 @@ class ContinuousPlasma(GFlowNetEnv):
         See: get_policy_output()
         """
         return policy_output[:, -2]
+
+
+    def sample_actions_batch(
+        self,
+        policy_outputs: TensorType["n_states", "policy_output_dim"],
+        mask: Optional[TensorType["n_states", "mask_dim"]] = None,
+        states_from: List = None,
+        is_backward: Optional[bool] = False,
+        random_action_prob: Optional[float] = 0.0,
+        temperature_logits: Optional[float] = 1.0,
+    ) -> Tuple[List[Tuple], TensorType["n_states"]]:
+        """
+        Samples a batch of actions from a batch of policy outputs.
+
+        This method overwrites the methof of the GFlowNetEnv because it
+        is a continious enviroment.
+
+        Parameters
+        ----------
+        policy_outputs : tensor
+            The output of the GFlowNet policy model.
+        mask : tensor
+            The mask of invalid actions. For continuous or mixed environments, the mask
+            may be tensor with an arbitrary length contaning information about special
+            states, as defined elsewhere in the environment.
+        states_from : tensor
+            The states originating the actions, in GFlowNet format. Ignored in discrete
+            environments and only required in certain continuous environments.
+        is_backward : bool
+            True if the actions are backward, False if the actions are forward
+            (default).
+        random_action_prob : float, optional
+            The probability of sampling a random action. If larger than one, the model
+            outputs will be replaced by a random policy vector with probability
+            `random_action_prob`, according to Bernoulli distribution.
+        temperature_logits : float, optional
+            A scalar by which the model outputs are divided to temper the sampling
+            distribution.
+
+        Returns
+        -------
+        actions : list
+            The list of sampled actions.
+        """
+        if not is_backward:
+            return self._sample_actions_batch_forward(
+                policy_outputs=policy_outputs,
+                mask=mask,
+                states_from=states_from,
+                random_action_prob=random_action_prob,
+                temperature_logits=temperature_logits,
+            )
+        else:
+            return self._sample_actions_batch_backward(
+                policy_outputs=policy_outputs,
+                mask=mask,
+                states_from=states_from,
+                random_action_prob=random_action_prob,
+                temperature_logits=temperature_logits,
+            )
+
+    def _sample_actions_batch_forward(
+        self,
+        policy_outputs: TensorType["n_states", "policy_output_dim"],
+        mask: Optional[TensorType["n_states", "mask_dim"]] = None,
+        states_from: List = None,
+        random_action_prob: Optional[float] = 0.0,
+        temperature_logits: Optional[float] = 1.0,
+    ) -> Tuple[List[Tuple], TensorType["n_states"]]:
+        """
+        Samples a a batch of forward actions from a batch of policy outputs.
+
+        An action indicates, for each dimension, the absolute increment of the
+        dimension value. However, in order to ensure that trajectories have finite
+        length, increments must have a minumum increment (self.min_incr) except if the
+        originating state is the source state (special case, see
+        get_mask_invalid_actions_forward()). Furthermore, absolute increments must also
+        be smaller than the distance from the dimension value to the edge of the cube
+        (1.0). In order to accomodate these constraints, first relative
+        increments (in [0, 1]) are sampled from a (mixture of) Beta distribution(s),
+        where 0.0 indicates an absolute increment of min_incr and 1.0 indicates an
+        absolute increment of 1 - x + min_incr (going to the edge).
+
+        Therefore, given a dimension value x, a relative increment r, a minimum
+        increment m and a maximum value 1, the absolute increment a is given by:
+
+        a = m + r * (1 - x - m)
+
+        The continuous distribution to sample the continuous action described above
+        must be mixed with the discrete distribution to model the sampling of the EOS
+        action. The EOS action can be sampled from any state except from the source
+        state or whether the trajectory is done. That the EOS action is invalid is
+        indicated by mask[-1] being False.
+
+        Finally, regarding the constraints on the increments, the following special
+        cases are taken into account:
+
+        - The originating state is the source state: in this case, the minimum
+          increment is 0.0 instead of self.min_incr. This is to ensure that the entire
+          state space can be reached. This is indicated by mask[-2] being False.
+        - The value at any dimension is at a distance from the cube edge smaller than the
+          minimum increment (x > 1 - m). In this case, only EOS is valid.
+          This is indicated by mask[0] being True (continuous actions are invalid).
+        """
+        # Initialize variables
+        n_states = policy_outputs.shape[0]
+        mask = torch.as_tensor(mask, dtype=torch.bool, device=self.device)
+        states_from_tensor = tfloat(
+            states_from, float_type=self.float, device=self.device
+        )
+        is_categorical = (~mask[:, : self.n_discrete_actions]).any(dim=1)
+        is_continuous = ~is_categorical
+        is_eos = torch.zeros(n_states, dtype=torch.bool, device=self.device)
+        # Determine source states
+        is_source = ~mask[:, self.source_flag_idx]
+        # EOS is the only possible action if continuous actions are invalid.
+        is_eos_forced = mask[:, self.continuous_action_idx] & is_continuous
+        is_eos[is_eos_forced] = True
+        # Ensure that is_eos_forced does not include any source state
+        assert not torch.any(torch.logical_and(is_source, is_eos_forced))
+
+        # Randomize actions and temper the logits
+        logits_sampling = self.randomize_and_temper_sampling_distribution(
+            policy_outputs, random_action_prob, temperature_logits
+        )
+
+        # Sample categorical choices
+        actions_tensor = torch.full(
+            (n_states, self.n_continuous_dims + 3),
+            torch.inf,
+            dtype=self.float,
+            device=self.device,
+        )
+        if torch.any(is_categorical):
+            categorical_logits = logits_sampling[
+                is_categorical, : self.n_discrete_actions
+            ].clone()
+            categorical_mask = mask[is_categorical, : self.n_discrete_actions]
+            categorical_logits[categorical_mask] = -torch.inf
+            categorical_indices = Categorical(logits=categorical_logits).sample()
+            categorical_actions = tfloat(
+                self.action_space[: self.n_discrete_actions],
+                float_type=self.float,
+                device=self.device,
+            )
+            actions_tensor[is_categorical] = categorical_actions[categorical_indices]
+
+        # Sample EOS from Bernoulli distribution
+        do_eos = torch.logical_and(
+            is_continuous & ~is_source, ~is_eos_forced
+        )
+        if torch.any(do_eos):
+            is_eos_sampled = torch.zeros_like(do_eos)
+            logits_eos = self._get_policy_eos_logit(logits_sampling)[do_eos]
+            distr_eos = Bernoulli(logits=logits_eos)
+            is_eos_sampled[do_eos] = tbool(distr_eos.sample(), device=self.device)
+            is_eos[is_eos_sampled] = True
+        # Sample (relative) increments if EOS is not the (sampled or forced) action
+        do_increments = is_continuous & ~is_eos
+        if torch.any(do_increments):
+            distr_increments = self._make_increments_distribution(
+                logits_sampling[do_increments]
+            )
+            # Shape of increments: [n_do_increments, n_continuous_dims]
+            increments = distr_increments.sample()
+            # Compute absolute increments from sampled relative increments if state is
+            # not source
+            is_relative = ~is_source[do_increments]
+            states_from_rel = tfloat(
+                states_from_tensor[do_increments],
+                float_type=self.float,
+                device=self.device,
+            )[is_relative][:, self.continuous_param_indices]
+            increments[is_relative] = self.relative_to_absolute_increments(
+                states_from_rel,
+                increments[is_relative],
+                is_backward=False,
+            )
+        # Build actions
+        if torch.any(do_increments):
+            # Add the continuous-action sentinels and source flag.
+            actions_tensor[do_increments, :2] = -1
+            actions_tensor[do_increments, 2:-1] = increments
+            actions_tensor[do_increments, -1] = 0
+        actions_tensor[is_source & do_increments, -1] = 1
+        return [tuple(a) for a in actions_tensor.tolist()]
+
+    def _sample_actions_batch_backward(
+        self,
+        policy_outputs: TensorType["n_states", "policy_output_dim"],
+        mask: Optional[TensorType["n_states", "mask_dim"]] = None,
+        states_from: List = None,
+        random_action_prob: Optional[float] = 0.0,
+        temperature_logits: Optional[float] = 1.0,
+    ) -> Tuple[List[Tuple], TensorType["n_states"]]:
+        """
+        Samples a a batch of backward actions from a batch of policy outputs.
+
+        An action indicates, for each dimension, the absolute increment of the
+        dimension value. However, in order to ensure that trajectories have finite
+        length, increments must have a minumum increment (self.min_incr). Furthermore,
+        absolute increments must also be smaller than the distance from the dimension
+        value to the edge of the cube. In order to accomodate these constraints, first
+        relative increments (in [0, 1]) are sampled from a (mixture of) Beta
+        distribution(s), where 0.0 indicates an absolute increment of min_incr and 1.0
+        indicates an absolute increment of x (going back to the source).
+
+        Therefore, given a dimension value x, a relative increment r, a minimum
+        increment m and a maximum value 1, the absolute increment a is given by:
+
+        a = m + r * (x - m)
+
+        The continuous distribution to sample the continuous action described above
+        must be mixed with the discrete distribution to model the sampling of the back
+        to source (BTS) action. While the BTS action is also a continuous action, it
+        needs to be modelled with a (discrete) Bernoulli distribution in order to
+        ensure that this action has positive likelihood.
+
+        Finally, regarding the constraints on the increments, the special case where
+        the trajectory is done and the only possible action is EOS, is also taken into
+        account.
+        """
+        # Initialize variables
+        n_states = policy_outputs.shape[0]
+        mask = torch.as_tensor(mask, dtype=torch.bool, device=self.device)
+        is_categorical = (~mask[:, : self.n_discrete_actions]).any(dim=1)
+        is_continuous = ~is_categorical
+        is_bts = torch.zeros(n_states, dtype=torch.bool, device=self.device)
+        # EOS is the only possible action only if done is True.
+        is_eos = ~mask[:, self.eos_idx] & is_continuous
+        # Back-to-source (BTS) is the only possible action when it is unmasked.
+        is_bts_forced = ~mask[:, self.source_flag_idx] & is_continuous
+        is_bts[is_bts_forced] = True
+
+        # Randomize actions and temper the logits
+        logits_sampling = self.randomize_and_temper_sampling_distribution(
+            policy_outputs, random_action_prob, temperature_logits
+        )
+
+        # Sample categorical choices
+        actions_tensor = torch.full(
+            (n_states, self.n_continuous_dims + 3),
+            torch.inf,
+            dtype=self.float,
+            device=self.device,
+        )
+        if torch.any(is_categorical):
+            categorical_logits = logits_sampling[
+                is_categorical, : self.n_discrete_actions
+            ].clone()
+            categorical_mask = mask[is_categorical, : self.n_discrete_actions]
+            categorical_logits[categorical_mask] = -torch.inf
+            categorical_indices = Categorical(logits=categorical_logits).sample()
+            categorical_actions = tfloat(
+                self.action_space[: self.n_discrete_actions],
+                float_type=self.float,
+                device=self.device,
+            )
+            actions_tensor[is_categorical] = categorical_actions[categorical_indices]
+
+        # Sample BTS from Bernoulli distribution
+        do_bts = is_continuous & ~is_bts_forced & ~is_eos
+        if torch.any(do_bts):
+            is_bts_sampled = torch.zeros_like(do_bts)
+            logits_bts = self._get_policy_source_logit(logits_sampling)[do_bts]
+            distr_bts = Bernoulli(logits=logits_bts)
+            is_bts_sampled[do_bts] = tbool(distr_bts.sample(), device=self.device)
+            is_bts[is_bts_sampled] = True
+        # Sample relative increments if actions are neither BTS nor EOS
+        do_increments = is_continuous & ~is_bts & ~is_eos
+        if torch.any(do_increments):
+            distr_increments = self._make_increments_distribution(
+                logits_sampling[do_increments]
+            )
+            # Shape of increments_rel: [n_do_increments, n_continuous_dims]
+            increments = distr_increments.sample()
+            # Compute absolute increments from all sampled relative increments
+            states_from_rel = tfloat(
+                states_from, float_type=self.float, device=self.device
+            )[do_increments][:, self.continuous_param_indices]
+            increments = self.relative_to_absolute_increments(
+                states_from_rel,
+                increments,
+                is_backward=True,
+            )
+        # Build actions
+        actions_tensor[is_eos] = tfloat(
+            self.eos, float_type=self.float, device=self.device
+        )
+        if torch.any(do_increments):
+            # Add the continuous-action sentinels and source flag.
+            actions_tensor[do_increments, :2] = -1
+            actions_tensor[do_increments, 2:-1] = increments
+            actions_tensor[do_increments, -1] = 0
+        if torch.any(is_bts):
+            # BTS uses the representative source action.
+            actions_tensor[is_bts] = tfloat(
+                self.representative_source,
+                float_type=self.float,
+                device=self.device,
+            )
+        return [tuple(a) for a in actions_tensor.tolist()]
 
 
     ############### WIP LINE ###############
@@ -1178,7 +1477,7 @@ class ContinuousPlasma(GFlowNetEnv):
         environment.
         """
         n_letters = len(self.letters)
-        n_per_length = tlong(
+        n_per_length = tfloat(
             [n_letters**length for length in range(1, self.max_length + 1)],
             device=self.device,
         )
